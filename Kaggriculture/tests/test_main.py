@@ -9,10 +9,12 @@ from kaggle_environments import make
 from main import (
     ANIMALS,
     FieldPlan,
+    TownDemand,
     _field_tasks,
     _logistics_actions,
     _market_orders,
     _move_toward,
+    _town_demand,
     agent,
 )
 
@@ -44,6 +46,7 @@ def empty_plan(**overrides) -> FieldPlan:
         empty_structures={"PASTURE": [], "COOP": []},
         unfed_animals=[],
         fertilizable_wheat=[],
+        demand=_town_demand(None, day=0),
     )
     base.update(overrides)
     return FieldPlan(**base)
@@ -90,6 +93,35 @@ class HarvestTimingTests(unittest.TestCase):
         plan = _field_tasks(farm, {"seeds": {}}, day=3)  # still within the bonus window
         actions_here = [t.action[0] for t in plan.tasks if t.position == (0, 0)]
         self.assertIn("HARVEST", actions_here)
+
+
+class TownDemandTests(unittest.TestCase):
+    def test_wheat_allocation_is_unaffected_by_town_demand(self) -> None:
+        """Integration guardrail: the feed-safety wheat target must stay
+        exactly what livestock-stack alone would compute, regardless of
+        which shops are unlocked."""
+        farm = make_farm()
+        private = {"seeds": {}}
+        no_town = _field_tasks(farm, private, day=0, town=None)
+        busy_town = _field_tasks(
+            farm, private, day=0, town={"unlocked_shops": ["PET_CAFE", "YARN_STORE"]}
+        )
+        self.assertEqual(no_town.crop_targets["WHEAT"], busy_town.crop_targets["WHEAT"])
+
+    def test_unlocked_shop_shifts_cash_crop_allocation_toward_its_demand(self) -> None:
+        farm = make_farm()
+        private = {"seeds": {}}
+        no_shops = _field_tasks(farm, private, day=0, town=None)
+        pet_cafe = _field_tasks(farm, private, day=0, town={"unlocked_shops": ["PET_CAFE"]})
+
+        self.assertGreater(
+            pet_cafe.crop_targets["CARROT"], no_shops.crop_targets["CARROT"]
+        )
+
+    def test_demand_score_only_counts_currently_unlocked_shops(self) -> None:
+        demand = _town_demand({"unlocked_shops": ["PET_CAFE"]}, day=0)
+        self.assertEqual(demand.shop_units["CARROT"], 2)
+        self.assertEqual(demand.shop_units["WOOL"], 0)
 
 
 class AllocationTests(unittest.TestCase):

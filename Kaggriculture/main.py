@@ -9,6 +9,18 @@ The early crop patch funds NE expansion; NE then supplies the additional
 wheat, pastures, and workers needed for a larger herd.  Sheep and geese are
 secondary occupants after cow capacity is funded.  Milk and wool are sold
 only in small, high-price batches to avoid manufacturing a deep glut.
+
+This is an integration test of two independently-validated strategies:
+`livestock-stack`'s feed-safe animal ramp (all of the constants/logic
+above, untouched) is kept as the base, and `town-oracle`'s observed-demand
+module is grafted on, but scoped *only* to the cash-crop side (allocation
+across CARROT/TOMATO/MELON and their sell timing/thresholds). Wheat
+allocation, the feed-safety gates, and the animal-purchase logic are
+deliberately left exactly as they were in `livestock-stack`, since that
+strategy's robustness (zero escapes, low variance, won 100% of paired
+Tier 2 seeds) is the reason it's the stronger of the two parents -- this
+tests whether demand-awareness can improve its cash-crop engine without
+touching what already works.
 """
 
 from __future__ import annotations
@@ -149,6 +161,80 @@ for _animal, _product in ANIMAL_PRODUCT.items():
 # sell only a small tranche, allowing town demand to repair the price.
 MAX_SELL_PER_TURN = {"MELON": 5, "MILK": 4, "WOOL": 3}
 MIN_SELL_BATCH = {"MILK": 4, "WOOL": 3}
+
+# --- Town demand module, ported from `strategy/town-oracle` -------------
+# Scoped to the cash-crop side only: which of CARROT/TOMATO/MELON to grow,
+# and when to sell them. Wheat's allocation and every animal-safety gate
+# above are untouched.
+CASH_CROP_PRODUCTS = {"CARROT", "TOMATO", "MELON"}
+TOWN_SHOP_INTERVAL = 4
+TOWN_CENTER_INTERVAL = 12
+SHOP_PRODUCT_UNITS = {
+    "BAKERY": {"EGG": 1, "WHEAT": 1},
+    "PIZZA_SHOP": {"MILK": 1, "TOMATO": 1, "WHEAT": 1},
+    "BRUNCH_SPOT": {"EGG": 1, "WHEAT": 1, "STRAWBERRY": 1},
+    "YARN_STORE": {"WOOL": 2},
+    "ICE_CREAM_SHOP": {"STRAWBERRY": 1, "MILK": 1, "WHEAT": 1},
+    "PET_CAFE": {"CARROT": 2},
+    "SMOOTHIE_SHOP": {"STRAWBERRY": 1, "MILK": 1},
+    "FARMERS_MARKET": {"WHEAT": 1, "CARROT": 1, "TOMATO": 1, "STRAWBERRY": 1},
+}
+
+
+@dataclass(frozen=True)
+class TownDemand:
+    """Observed product demand, without predicting future shop unlocks."""
+
+    score: dict[str, int]
+    shop_units: dict[str, int]
+
+
+def _town_demand(town: dict[str, Any] | None, day: int) -> TownDemand:
+    """Score only currently-unlocked shops at their documented demand rate."""
+    center_units = 4 if day >= 20 else 2 if day >= 10 else 1
+    score = {product: center_units for product in SELL_SPECS}
+    shop_units = {product: 0 for product in SELL_SPECS}
+    unlocked = _as_dict(town).get("unlocked_shops", [])
+    if not isinstance(unlocked, list):
+        unlocked = []
+
+    for shop_name in unlocked:
+        products = SHOP_PRODUCT_UNITS.get(shop_name)
+        if products is None:
+            continue
+        for product, units in products.items():
+            if product not in score:
+                continue
+            shop_units[product] += units
+            score[product] += 3 * units
+
+    return TownDemand(score=score, shop_units=shop_units)
+
+
+def _demand_adjusted_cash_crop_targets(budget: int, demand: TownDemand) -> dict[str, int]:
+    """Split the cash-crop budget toward whichever crop known shops want,
+    instead of `livestock-stack`'s fixed 45/35/20 ratio."""
+    weights = {
+        "CARROT": 2.2 + 0.35 * demand.score["CARROT"],
+        "TOMATO": 2.5 + 0.35 * demand.score["TOMATO"],
+        # No town shop consumes melons; keep a small diversification share.
+        "MELON": 0.25,
+    }
+    total_weight = sum(weights.values())
+    ratios = {crop: weight / total_weight for crop, weight in weights.items()}
+    return _allocate_by_ratio(budget, CASH_CROPS, ratios)
+
+
+def _post_town_drain_window(product: str, demand: TownDemand, hour: int) -> bool:
+    """Sell just after the town has drained this product's inventory."""
+    interval = TOWN_SHOP_INTERVAL if demand.shop_units.get(product, 0) else TOWN_CENTER_INTERVAL
+    return hour % interval == 1
+
+
+def _sell_threshold_ratio(product: str, threshold_ratio: float, demand: TownDemand) -> float:
+    """Known demand permits a modestly earlier sale without betting on it."""
+    discount = min(0.15, 0.025 * demand.shop_units.get(product, 0))
+    return max(0.50, threshold_ratio - discount)
 
 
 @dataclass(frozen=True)
@@ -382,14 +468,21 @@ class FieldPlan:
     empty_structures: dict[str, list[tuple[int, int]]]
     unfed_animals: list[tuple[int, int]]
     fertilizable_wheat: list[tuple[int, int]]
+    demand: TownDemand
 
 
-def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> FieldPlan:
+def _field_tasks(
+    farm: dict[str, Any],
+    private: dict[str, Any],
+    day: int,
+    town: dict[str, Any] | None = None,
+) -> FieldPlan:
     """Build all current position-based unit tasks and the counts needed for
     market planning."""
     positions = _unlocked_positions(farm)
     field_capacity = len(positions)
     scan = _scan_field(farm, day, positions)
+    demand = _town_demand(town, day)
     tasks = list(scan.tasks)
 
     livestock_budget = round(field_capacity * LIVESTOCK_SLOT_RATIO)
@@ -399,13 +492,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
     )
     cash_crop_budget = max(0, field_capacity - livestock_budget - wheat_target)
     crop_targets = {crop: 0 for crop in PLANTABLE_CROPS}
-    crop_targets.update(
-        _allocate_by_ratio(
-            cash_crop_budget,
-            CASH_CROPS,
-            {crop: CROPS[crop].allocation_ratio for crop in CASH_CROPS},
-        )
-    )
+    crop_targets.update(_demand_adjusted_cash_crop_targets(cash_crop_budget, demand))
     crop_targets["WHEAT"] = wheat_target
 
     animal_targets = _allocate_by_ratio(
@@ -509,6 +596,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         empty_structures=empty_structures,
         unfed_animals=unfed_animals,
         fertilizable_wheat=fertilizable_wheat,
+        demand=demand,
     )
 
 
@@ -798,9 +886,21 @@ def _market_orders(
         if in_shed <= 0:
             continue
         price = int(prices.get(product, 0))
-        threshold_met = price >= threshold_ratio * base_price
+        is_cash_crop = product in CASH_CROP_PRODUCTS
+        effective_threshold_ratio = (
+            _sell_threshold_ratio(product, threshold_ratio, plan.demand)
+            if is_cash_crop
+            else threshold_ratio
+        )
+        threshold_met = price >= effective_threshold_ratio * base_price
         capacity_pressure = shed_total >= SHED_CAPACITY - plan.field_capacity
-        if not (threshold_met or capacity_pressure or force_sell):
+        # Only cash crops wait for a post-town-drain window: animal products
+        # keep livestock-stack's original, already-conservative timing so
+        # this integration doesn't touch what made that strategy robust.
+        in_sale_window = (
+            _post_town_drain_window(product, plan.demand, hour) if is_cash_crop else True
+        )
+        if not ((threshold_met and in_sale_window) or capacity_pressure or force_sell):
             continue
         min_batch = MIN_SELL_BATCH.get(product, 1)
         if not force_sell and not capacity_pressure and in_shed < min_batch:
@@ -973,6 +1073,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     farm = _as_dict(farms[player])
     private = _as_dict(obs.get("private"))
     market = _as_dict(obs.get("market"))
+    town = _as_dict(obs.get("town"))
     day = int(obs.get("day", 0))
     hour = int(obs.get("hour", 0))
     board_size = len(farm.get("tiles", []))
@@ -980,7 +1081,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     hand_positions = [tuple(position) for position in farm.get("hands", [])]
     unit_positions = [farmer_position, *hand_positions]
 
-    plan = _field_tasks(farm, private, day)
+    plan = _field_tasks(farm, private, day, town)
     fill_priority = _animal_fill_priority(plan)
     logistics = _logistics_actions(unit_positions, private, board_size, plan, fill_priority)
 

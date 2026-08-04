@@ -15,8 +15,14 @@ class RunLocalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             agent_path = Path(temporary_directory) / "candidate.py"
             agent_path.write_text(
+                "from dataclasses import dataclass\n"
+                "\n"
+                "@dataclass\n"
+                "class StrategyConfig:\n"
+                "    action: str = 'PASS'\n"
+                "\n"
                 "def agent(obs):\n"
-                "    return {'farmer': ['PASS'], 'hands': [], 'market': []}\n",
+                "    return {'farmer': [StrategyConfig().action], 'hands': [], 'market': []}\n",
                 encoding="utf-8",
             )
 

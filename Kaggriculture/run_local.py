@@ -45,6 +45,11 @@ def load_agent(agent_path: Path) -> Agent:
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load agent module from {resolved}")
     module = importlib.util.module_from_spec(spec)
+    # `@dataclass` resolves postponed annotations through
+    # `sys.modules[cls.__module__]` while the candidate module executes.
+    # Register before exec so full Kaggriculture agents (which use
+    # dataclasses) load just as reliably as a tiny function-only fixture.
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     candidate = getattr(module, "agent", None)
     if not callable(candidate):

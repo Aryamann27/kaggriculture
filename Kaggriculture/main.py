@@ -1,21 +1,13 @@
 """Kaggriculture submission entrypoint.
 
-This strategy runs a hybrid crop-plus-livestock economy. Crops (wheat,
-carrot, tomato, melon) are the primary land use and the funded cash
-engine -- they generate steady revenue from day 2-3 with no ongoing
-dependency. Animals (cow/sheep/goose) get a smaller, dedicated share of
-land and are bought only out of a cash *surplus* above a healthy reserve,
-never out of the starting bank: unlike crops -- which always decay after
-their yield cap and must be replanted -- an animal never decays once placed
-and fed, so it's a one-time capital investment with an indefinite payback,
-but it also needs a steady wheat feed supply or it starves in as little as
-two days. Funding animals from organic crop revenue (rather than an
-upfront capital dump) avoids a boom-bust cash crunch during the ramp-up
-before animals and their own feed wheat mature. Land is purchased once the
-current quadrant's targets are filled and cash allows. Selling is
-price-aware per product, tuned to how hard each one crashes under
-oversupply. The helpers are pure where practical so future policies can be
-improved without changing the Kaggle action protocol.
+This strategy runs a hybrid crop-plus-livestock economy. It treats the
+public list of unlocked town shops as observed demand: wheat remains the
+low-risk fallback, while crop and livestock targets shift only toward
+products demanded by shops already on the board. Premium output is capped
+and sold in demand-sized batches after town consumption, reducing exposure
+to the shared market's steep glut curves. Animals are bought only out of a
+cash *surplus* above a healthy reserve and wheat is kept for feed, so demand
+response never creates a fragile boom-bust ramp.
 """
 
 from __future__ import annotations
@@ -82,9 +74,10 @@ CROPS = {
     "MELON":      CropSpec(80, 10, 12, 6, False, base_price=250, sell_threshold_ratio=0.80, allocation_ratio=0.15),
 }
 
-# Strawberry is deferred: same capital-intensive, glut-sensitive profile as
-# tomato/melon without adding a distinct risk/return trade-off yet.
-PLANTABLE_CROPS = ["WHEAT", "CARROT", "TOMATO", "MELON"]
+# Strawberry is only allocated when an already-unlocked shop consumes it.
+# Its small target cap below prevents a slow, premium crop from dominating
+# the field if a single shop happens to unlock early.
+PLANTABLE_CROPS = ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON"]
 
 # Plant only if there's enough season left for the crop to mature, produce,
 # and be sold before the engine stops accepting new work.
@@ -145,9 +138,27 @@ for _animal, _product in ANIMAL_PRODUCT.items():
     SELL_SPECS[_product] = (_spec.base_price, _spec.sell_threshold_ratio)
 
 # A single order can walk a glut-sensitive product's price down its steep
-# curve in one shot; capping it lets natural production and town
-# consumption partially refill the market between sales.
-MAX_SELL_PER_TURN = {"MELON": 5, "WOOL": 5}
+# curve in one shot. Premium products are therefore capped at the observed
+# quantity the town just consumed, while staple caps remain deliberately
+# wider so wheat stays a practical fallback crop.
+PREMIUM_PRODUCTS = {"STRAWBERRY", "MELON", "MILK", "WOOL"}
+STAPLE_SELL_CAP = {"WHEAT": 6, "CARROT": 4, "TOMATO": 4, "EGG": 3}
+
+# The observation does not expose configuration, so these match the public
+# default rules. A score measures demand per town-center interval: each shop
+# runs three times in that interval and single-product shops consume twice.
+TOWN_SHOP_INTERVAL = 4
+TOWN_CENTER_INTERVAL = 12
+SHOP_PRODUCT_UNITS = {
+    "BAKERY": {"EGG": 1, "WHEAT": 1},
+    "PIZZA_SHOP": {"MILK": 1, "TOMATO": 1, "WHEAT": 1},
+    "BRUNCH_SPOT": {"EGG": 1, "WHEAT": 1, "STRAWBERRY": 1},
+    "YARN_STORE": {"WOOL": 2},
+    "ICE_CREAM_SHOP": {"STRAWBERRY": 1, "MILK": 1, "WHEAT": 1},
+    "PET_CAFE": {"CARROT": 2},
+    "SMOOTHIE_SHOP": {"STRAWBERRY": 1, "MILK": 1},
+    "FARMERS_MARKET": {"WHEAT": 1, "CARROT": 1, "TOMATO": 1, "STRAWBERRY": 1},
+}
 
 
 @dataclass(frozen=True)
@@ -360,6 +371,89 @@ def _wheat_feed_demand(animal_count: int) -> int:
 
 
 @dataclass(frozen=True)
+class TownDemand:
+    """Observed product demand, without predicting future shop unlocks."""
+
+    score: dict[str, int]
+    shop_units: dict[str, int]
+    center_units: int
+
+
+def _town_demand(town: dict[str, Any] | None, day: int) -> TownDemand:
+    """Score only currently-unlocked shops at their documented demand rate."""
+    center_units = 4 if day >= 20 else 2 if day >= 10 else 1
+    score = {product: center_units for product in SELL_SPECS}
+    shop_units = {product: 0 for product in SELL_SPECS}
+    unlocked = _as_dict(town).get("unlocked_shops", [])
+    if not isinstance(unlocked, list):
+        unlocked = []
+
+    for shop_name in unlocked:
+        products = SHOP_PRODUCT_UNITS.get(shop_name)
+        if products is None:
+            continue
+        for product, units in products.items():
+            if product not in score:
+                continue
+            shop_units[product] += units
+            score[product] += 3 * units
+
+    return TownDemand(score=score, shop_units=shop_units, center_units=center_units)
+
+
+def _demand_adjusted_crop_targets(budget: int, demand: TownDemand) -> dict[str, int]:
+    """Allocate crop tiles toward known town demand, retaining wheat safety."""
+    weights = {
+        # Wheat is always useful for feed and is comparatively glut-resistant.
+        "WHEAT": 3.0 + 0.25 * demand.score["WHEAT"],
+        "CARROT": 2.2 + 0.35 * demand.score["CARROT"],
+        "TOMATO": 2.5 + 0.35 * demand.score["TOMATO"],
+        # Do not speculate on strawberry before a real shop asks for it.
+        "STRAWBERRY": (
+            0.25 + 0.35 * demand.score["STRAWBERRY"]
+            if demand.shop_units["STRAWBERRY"] > 0
+            else 0.0
+        ),
+        # No town shop consumes melons, so keep only a small diversification
+        # allocation and rely on strict sale chunking to avoid a premium glut.
+        "MELON": 0.25,
+    }
+    total_weight = sum(weights.values())
+    ratios = {crop: weight / total_weight for crop, weight in weights.items()}
+    targets = _allocate_by_ratio(budget, PLANTABLE_CROPS, ratios)
+    for crop, share in {"STRAWBERRY": 0.15, "MELON": 0.10}.items():
+        cap = max(1, int(budget * share))
+        overflow = max(0, targets[crop] - cap)
+        if overflow:
+            targets[crop] -= overflow
+            targets["WHEAT"] += overflow
+    return targets
+
+
+def _demand_adjusted_animal_targets(budget: int, demand: TownDemand) -> dict[str, int]:
+    """Favor animals whose product is consumed by known shops, not guesses."""
+    weights = {
+        "COW": 1.0 + 0.45 * demand.shop_units["MILK"],
+        "SHEEP": 0.4 + 0.50 * demand.shop_units["WOOL"],
+        "GOOSE": 0.8 + 0.60 * demand.shop_units["EGG"],
+    }
+    total_weight = sum(weights.values())
+    ratios = {animal: weight / total_weight for animal, weight in weights.items()}
+    targets = _allocate_by_ratio(budget, PLANTABLE_ANIMALS, ratios)
+
+    # At most 60% of the observed town demand is allocated to our herd. The
+    # remainder is headroom for the opponent and for market volatility. This
+    # is especially important for milk and wool, which can collapse to $1.
+    daily_output = {"COW": 0.5, "SHEEP": 1 / 3, "GOOSE": 1.0}
+    hard_caps = {"COW": 6, "SHEEP": 4, "GOOSE": 6}
+    for animal, product in ANIMAL_PRODUCT.items():
+        daily_town_demand = 2 * demand.score[product]
+        demand_cap = max(1, math.ceil(0.60 * daily_town_demand / daily_output[animal]))
+        targets[animal] = min(targets[animal], demand_cap, hard_caps[animal])
+    return targets
+
+
+@dataclass(frozen=True)
 class FieldPlan:
     tasks: list[Task]
     field_capacity: int
@@ -367,6 +461,7 @@ class FieldPlan:
     crop_maturing: dict[str, int]
     crop_targets: dict[str, int]
     animal_targets: dict[str, int]
+    demand: TownDemand
     occupied_by_animal: dict[str, int]
     structures_built: dict[str, int]
     empty_structures: dict[str, list[tuple[int, int]]]
@@ -374,12 +469,18 @@ class FieldPlan:
     fertilizable_wheat: list[tuple[int, int]]
 
 
-def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> FieldPlan:
+def _field_tasks(
+    farm: dict[str, Any],
+    private: dict[str, Any],
+    day: int,
+    town: dict[str, Any] | None = None,
+) -> FieldPlan:
     """Build all current position-based unit tasks and the counts needed for
     market planning."""
     positions = _unlocked_positions(farm)
     field_capacity = len(positions)
     scan = _scan_field(farm, day, positions)
+    demand = _town_demand(town, day)
     tasks = list(scan.tasks)
 
     shed = _as_dict(private.get("shed"))
@@ -388,11 +489,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
 
     crop_budget = round(field_capacity * CROP_LAND_SHARE)
     livestock_budget = max(0, field_capacity - crop_budget)
-    crop_targets = _allocate_by_ratio(
-        crop_budget,
-        PLANTABLE_CROPS,
-        {c: CROPS[c].allocation_ratio for c in PLANTABLE_CROPS},
-    )
+    crop_targets = _demand_adjusted_crop_targets(crop_budget, demand)
     # Wheat also has to cover animal feed; if that demand exceeds its normal
     # crop-ratio share, let it claim more of the shared empty-tile
     # competition below rather than capping it -- a smaller tomato patch is
@@ -401,11 +498,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         MIN_WHEAT_TILES, crop_targets["WHEAT"], _wheat_feed_demand(animal_count)
     )
 
-    animal_targets = _allocate_by_ratio(
-        livestock_budget,
-        PLANTABLE_ANIMALS,
-        {a: ANIMALS[a].allocation_ratio for a in PLANTABLE_ANIMALS},
-    )
+    animal_targets = _demand_adjusted_animal_targets(livestock_budget, demand)
     structure_targets = {kind: 0 for kind in STRUCTURE_KINDS}
     for animal in PLANTABLE_ANIMALS:
         structure_targets[ANIMALS[animal].structure] += animal_targets[animal]
@@ -466,6 +559,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         crop_maturing=scan.crop_maturing,
         crop_targets=crop_targets,
         animal_targets=animal_targets,
+        demand=demand,
         occupied_by_animal=scan.occupied_by_animal,
         structures_built=scan.structures_built,
         empty_structures=empty_structures,
@@ -637,6 +731,31 @@ def _fib(n: int) -> int:
     return first
 
 
+def _post_town_drain_window(product: str, demand: TownDemand, hour: int) -> bool:
+    """Sell just after the town has drained this product's inventory."""
+    interval = TOWN_SHOP_INTERVAL if demand.shop_units.get(product, 0) else TOWN_CENTER_INTERVAL
+    return hour % interval == 1
+
+
+def _sale_quantity_cap(product: str, demand: TownDemand, hour: int) -> int:
+    """Limit premium replenishment to the amount town just consumed."""
+    drained = 0
+    if demand.shop_units.get(product, 0) and hour % TOWN_SHOP_INTERVAL == 1:
+        drained += demand.shop_units[product]
+    if hour % TOWN_CENTER_INTERVAL == 1:
+        drained += demand.center_units
+
+    if product in PREMIUM_PRODUCTS:
+        return max(1, drained)
+    return max(STAPLE_SELL_CAP.get(product, 1), drained)
+
+
+def _sell_threshold_ratio(product: str, threshold_ratio: float, demand: TownDemand) -> float:
+    """Known demand permits a modestly earlier sale without betting on demand."""
+    discount = min(0.15, 0.025 * demand.shop_units.get(product, 0))
+    return max(0.50, threshold_ratio - discount)
+
+
 def _market_orders(
     farm: dict[str, Any],
     private: dict[str, Any],
@@ -670,9 +789,11 @@ def _market_orders(
     )
 
     # Each product sells once its price clears a threshold tuned to how hard
-    # it crashes under oversupply, unless the shed is about to overflow or
-    # the season is ending and everything has to be liquidated regardless.
-    # Sells are queued before buys and hires so they always get an order slot.
+    # it crashes under oversupply. Hold normal sales until the turn after the
+    # town consumed that product: market orders run before town consumption,
+    # so selling on the consumption tick itself would refill inventory before
+    # the town has a chance to drain it. Shed pressure and end-game
+    # liquidation override the timing guard.
     for product, (base_price, threshold_ratio) in SELL_SPECS.items():
         in_shed = int(shed.get(product, 0))
         if product == "WHEAT" and not force_sell:
@@ -680,15 +801,15 @@ def _market_orders(
         if in_shed <= 0:
             continue
         price = int(prices.get(product, 0))
-        threshold_met = price >= threshold_ratio * base_price
+        threshold_met = price >= _sell_threshold_ratio(product, threshold_ratio, plan.demand) * base_price
         capacity_pressure = shed_total >= SHED_CAPACITY - plan.field_capacity
-        if not (threshold_met or capacity_pressure or force_sell):
+        in_sale_window = _post_town_drain_window(product, plan.demand, hour)
+        if not ((threshold_met and in_sale_window) or capacity_pressure or force_sell):
             continue
 
         quantity = in_shed
-        cap = MAX_SELL_PER_TURN.get(product)
-        if cap is not None and not force_sell:
-            quantity = min(quantity, cap)
+        if not (capacity_pressure or force_sell):
+            quantity = min(quantity, _sale_quantity_cap(product, plan.demand, hour))
         if quantity <= 0:
             continue
         orders.append(["SELL", product, quantity])
@@ -803,6 +924,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     farm = _as_dict(farms[player])
     private = _as_dict(obs.get("private"))
     market = _as_dict(obs.get("market"))
+    town = _as_dict(obs.get("town"))
     day = int(obs.get("day", 0))
     hour = int(obs.get("hour", 0))
     board_size = len(farm.get("tiles", []))
@@ -810,7 +932,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     hand_positions = [tuple(position) for position in farm.get("hands", [])]
     unit_positions = [farmer_position, *hand_positions]
 
-    plan = _field_tasks(farm, private, day)
+    plan = _field_tasks(farm, private, day, town)
     fill_priority = _animal_fill_priority(plan)
     logistics = _logistics_actions(unit_positions, private, board_size, plan, fill_priority)
 

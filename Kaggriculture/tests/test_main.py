@@ -13,6 +13,7 @@ from main import (
     _logistics_actions,
     _market_orders,
     _move_toward,
+    _town_demand,
     agent,
 )
 
@@ -33,10 +34,11 @@ def empty_plan(**overrides) -> FieldPlan:
     base = dict(
         tasks=[],
         field_capacity=25,
-        crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
-        crop_maturing={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
-        crop_targets={"WHEAT": 5, "CARROT": 4, "TOMATO": 5, "MELON": 3},
+        crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "STRAWBERRY": 0, "MELON": 0},
+        crop_maturing={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "STRAWBERRY": 0, "MELON": 0},
+        crop_targets={"WHEAT": 5, "CARROT": 4, "TOMATO": 5, "STRAWBERRY": 0, "MELON": 3},
         animal_targets={"COW": 4, "SHEEP": 2, "GOOSE": 1},
+        demand=_town_demand({}, day=0),
         occupied_by_animal={"COW": 0, "SHEEP": 0, "GOOSE": 0},
         structures_built={"PASTURE": 0, "COOP": 0},
         empty_structures={"PASTURE": [], "COOP": []},
@@ -94,7 +96,13 @@ class AllocationTests(unittest.TestCase):
     def test_empty_field_plants_multiple_crops_and_builds_structures(self) -> None:
         farm = make_farm()
         private = {
-            "seeds": {"WHEAT": 25, "CARROT": 25, "TOMATO": 25, "MELON": 25},
+            "seeds": {
+                "WHEAT": 25,
+                "CARROT": 25,
+                "TOMATO": 25,
+                "STRAWBERRY": 25,
+                "MELON": 25,
+            },
         }
         plan = _field_tasks(farm, private, day=0)
 
@@ -116,6 +124,60 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(ANIMALS["GOOSE"].structure, "COOP")
 
 
+class TownDemandTests(unittest.TestCase):
+    def test_scores_only_already_unlocked_shops(self) -> None:
+        demand = _town_demand(
+            {"unlocked_shops": ["PET_CAFE", "UNKNOWN_FUTURE_SHOP"]},
+            day=0,
+        )
+
+        # One town-center unit plus PET_CAFE's double order three times per
+        # center interval. Unknown shops must not be treated as predictions.
+        self.assertEqual(demand.score["CARROT"], 7)
+        self.assertEqual(demand.score["STRAWBERRY"], 1)
+        self.assertEqual(demand.shop_units["STRAWBERRY"], 0)
+
+    def test_pet_cafe_shifts_crop_targets_to_carrots_without_strawberry_bet(self) -> None:
+        farm = make_farm()
+        private = {"seeds": {}}
+        baseline = _field_tasks(farm, private, day=5, town={})
+        pet_cafe = _field_tasks(
+            farm,
+            private,
+            day=5,
+            town={"unlocked_shops": ["PET_CAFE"]},
+        )
+
+        self.assertGreater(pet_cafe.crop_targets["CARROT"], baseline.crop_targets["CARROT"])
+        self.assertEqual(pet_cafe.crop_targets["STRAWBERRY"], 0)
+        self.assertGreaterEqual(pet_cafe.crop_targets["WHEAT"], 4)
+
+    def test_strawberry_shop_enables_a_capped_strawberry_target(self) -> None:
+        farm = make_farm()
+        brunch = _field_tasks(
+            farm,
+            {"seeds": {}},
+            day=5,
+            town={"unlocked_shops": ["BRUNCH_SPOT"]},
+        )
+
+        self.assertGreater(brunch.crop_targets["STRAWBERRY"], 0)
+        self.assertLessEqual(brunch.crop_targets["STRAWBERRY"], 2)
+
+    def test_yarn_store_shifts_livestock_targets_to_sheep(self) -> None:
+        farm = make_farm()
+        baseline = _field_tasks(farm, {"seeds": {}}, day=5, town={})
+        yarn_store = _field_tasks(
+            farm,
+            {"seeds": {}},
+            day=5,
+            town={"unlocked_shops": ["YARN_STORE"]},
+        )
+
+        self.assertGreater(yarn_store.animal_targets["SHEEP"], baseline.animal_targets["SHEEP"])
+        self.assertGreater(yarn_store.animal_targets["SHEEP"], yarn_store.animal_targets["COW"])
+
+
 class MarketOrderTests(unittest.TestCase):
     def test_sell_threshold_differs_by_product(self) -> None:
         farm = make_farm()
@@ -128,6 +190,30 @@ class MarketOrderTests(unittest.TestCase):
 
         self.assertIn(["SELL", "WHEAT", 5], orders)
         self.assertFalse(any(o[0] == "SELL" and o[1] == "WOOL" for o in orders))
+
+    def test_sales_wait_for_the_turn_after_town_consumption(self) -> None:
+        farm = make_farm()
+        private = {"shed": {"WHEAT": 6}, "seeds": {}}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(demand=_town_demand({"unlocked_shops": ["BAKERY"]}, day=5))
+
+        before_drain = _market_orders(farm, private, market, day=5, hour=0, plan=plan)
+        after_drain = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        self.assertFalse(any(order[:2] == ["SELL", "WHEAT"] for order in before_drain))
+        self.assertIn(["SELL", "WHEAT", 6], after_drain)
+
+    def test_premium_sales_are_limited_to_observed_town_demand(self) -> None:
+        farm = make_farm()
+        private = {"shed": {"WOOL": 8}, "seeds": {}}
+        market = {"prices": {"WOOL": 200}}
+        plan = empty_plan(demand=_town_demand({"unlocked_shops": ["YARN_STORE"]}, day=5))
+
+        orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        # YARN_STORE removes two wool and the center removes one before this
+        # hour, so only three units replenish the observed drain.
+        self.assertIn(["SELL", "WOOL", 3], orders)
 
     def test_wheat_sale_reserves_the_animal_feed_buffer(self) -> None:
         farm = make_farm()

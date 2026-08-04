@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_local import append_result, load_agent, read_seeds
+from run_local import _farm_snapshot, append_result, load_agent, read_seeds
 
 
 class RunLocalTests(unittest.TestCase):
@@ -51,6 +51,34 @@ class RunLocalTests(unittest.TestCase):
                 json.loads(output_path.read_text(encoding="utf-8")),
                 row,
             )
+
+    def test_farm_snapshot_captures_strategy_diagnostics(self) -> None:
+        observation = {
+            "farms": [
+                {
+                    "money": 1234.0,
+                    "unlocked_quadrants": ["NW", "NE"],
+                    "tiles": [
+                        [
+                            None,
+                            {"kind": "WEED"},
+                            {"kind": "PLANT", "crop": "TOMATO"},
+                            {"kind": "PASTURE", "animal": "COW"},
+                        ]
+                    ],
+                }
+            ],
+            "private": {"shed": {"WHEAT": 3, "MILK": 0}},
+        }
+
+        snapshot = _farm_snapshot(observation, player=0)
+
+        self.assertEqual(snapshot["bank"], 1234.0)
+        self.assertEqual(snapshot["unlocked_quadrants"], 2)
+        self.assertEqual(snapshot["counts"]["weeds"], 1)
+        self.assertEqual(snapshot["crops"], {"TOMATO": 1})
+        self.assertEqual(snapshot["animals"], {"COW": 1})
+        self.assertEqual(snapshot["shed"], {"WHEAT": 3})
 
 
 if __name__ == "__main__":

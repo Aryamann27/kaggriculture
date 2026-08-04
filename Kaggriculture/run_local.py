@@ -157,13 +157,73 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _get(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _farm_snapshot(observation: Any, player: int) -> dict[str, Any]:
+    """Summarize public farm state plus the current player's private shed."""
+    farms = _get(observation, "farms", [])
+    farm = farms[player]
+    counts: dict[str, int] = {
+        "empty": 0,
+        "weeds": 0,
+        "plants": 0,
+        "structures": 0,
+        "animals": 0,
+    }
+    crops: dict[str, int] = {}
+    animals: dict[str, int] = {}
+    for row in farm["tiles"]:
+        for tile in row:
+            if tile is None:
+                counts["empty"] += 1
+            elif isinstance(tile, dict):
+                kind = tile.get("kind")
+                if kind == "WEED":
+                    counts["weeds"] += 1
+                elif kind == "PLANT":
+                    counts["plants"] += 1
+                    crop = tile.get("crop")
+                    crops[crop] = crops.get(crop, 0) + 1
+                elif kind in ("COOP", "PASTURE"):
+                    counts["structures"] += 1
+                    animal = tile.get("animal")
+                    if animal:
+                        counts["animals"] += 1
+                        animals[animal] = animals.get(animal, 0) + 1
+
+    private = _get(observation, "private", {})
+    shed = _get(private, "shed", {})
+    return {
+        "bank": float(farm["money"]),
+        "unlocked_quadrants": len(farm.get("unlocked_quadrants", [])),
+        "counts": counts,
+        "crops": crops,
+        "animals": animals,
+        "shed": {item: amount for item, amount in shed.items() if amount},
+    }
+
+
+def checkpoint_metrics(env: Any, player: int = 0) -> dict[str, dict[str, Any]]:
+    """Record day-10/day-20/final snapshots without saving a large replay."""
+    checkpoints: dict[str, dict[str, Any]] = {}
+    target_steps = {"day10": 10 * 24, "day20": 20 * 24, "final": len(env.steps) - 1}
+    for label, target in target_steps.items():
+        index = min(target, len(env.steps) - 1)
+        checkpoints[label] = _farm_snapshot(env.steps[index][player].observation, player)
+    return checkpoints
+
+
 def run_episode(
     candidate: Agent,
     opponent: str | Agent,
     seed: int,
     steps: int,
-) -> tuple[float, float, str, str, dict[str, Any]]:
-    """Run one game and return rewards, statuses, and the replay payload."""
+) -> tuple[float, float, str, str, dict[str, Any], dict[str, dict[str, Any]]]:
+    """Run one game and return rewards, statuses, replay payload, and metrics."""
     env = make(
         "kaggriculture",
         configuration={"episodeSteps": steps, "seed": seed},
@@ -178,6 +238,7 @@ def run_episode(
         str(candidate_state.status),
         str(opponent_state.status),
         env.toJSON(),
+        checkpoint_metrics(env),
     )
 
 
@@ -222,7 +283,14 @@ def main() -> None:
         error: str | None = None
         replay_path: str | None = None
         try:
-            candidate_reward, opponent_reward, candidate_status, opponent_status, replay = run_episode(
+            (
+                candidate_reward,
+                opponent_reward,
+                candidate_status,
+                opponent_status,
+                replay,
+                checkpoints,
+            ) = run_episode(
                 candidate,
                 opponent,
                 seed,
@@ -232,6 +300,7 @@ def main() -> None:
             candidate_reward = opponent_reward = 0.0
             candidate_status = opponent_status = "ERROR"
             replay = {}
+            checkpoints = {}
             error = f"{type(exc).__name__}: {exc}"
         elapsed_seconds = time.perf_counter() - started
         outcome = outcome_for(candidate_reward, opponent_reward)
@@ -259,6 +328,7 @@ def main() -> None:
             "duration_seconds": round(elapsed_seconds, 4),
             "replay_path": replay_path,
             "error": error,
+            "checkpoints": checkpoints,
         }
         if args.output:
             append_result(args.output, row)

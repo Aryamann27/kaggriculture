@@ -1,0 +1,3 @@
+# Fast deterministic smoke and self-play canaries.
+11
+314

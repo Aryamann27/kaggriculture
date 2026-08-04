@@ -1,0 +1,57 @@
+{
+  "baseline_sha": "d9f6383",
+  "strategies": [
+    {
+      "id": "multicrop-control",
+      "branch": "strategy/multicrop-control",
+      "description": "Historical crop-only control with corrected harvest timing."
+    },
+    {
+      "id": "staple-velocity",
+      "branch": "strategy/staple-velocity",
+      "description": "Wheat/carrot cash engine with early land expansion."
+    },
+    {
+      "id": "livestock-stack",
+      "branch": "strategy/livestock-stack",
+      "description": "Aggressive but feed-safe cow-led animal ramp."
+    },
+    {
+      "id": "town-oracle",
+      "branch": "strategy/town-oracle",
+      "description": "Shop-responsive production and sale policy."
+    },
+    {
+      "id": "ongoing-fertilizer",
+      "branch": "strategy/ongoing-fertilizer",
+      "description": "Tomato pipeline supported by geese and fertilizer."
+    }
+  ],
+  "tiers": {
+    "tier0": {
+      "seed_file": "seeds/canary.txt",
+      "opponents": [
+        "pass"
+      ],
+      "steps": 720,
+      "self_play": true
+    },
+    "tier1": {
+      "seed_file": "seeds/tier1.txt",
+      "opponents": [
+        "starter",
+        "random"
+      ],
+      "steps": 720,
+      "self_play": false
+    },
+    "tier2": {
+      "seed_file": "seeds/tier2.txt",
+      "opponents": [
+        "starter"
+      ],
+      "steps": 720,
+      "self_play": false
+    }
+  }
+}

@@ -20,9 +20,8 @@ LAST_HAND_HIRE_DAY = 28
 FINAL_ACTION_DAY = 29
 SAFETY_BUFFER_DAYS = 2
 
-LAND_ORDER = ["NE", "SW", "SE"]
-LAND_PRICES = {"NE": 1000, "SW": 2000, "SE": 4000}
-LAND_CASH_RESERVE = 500
+# The fixed 30-day control retains capital for crop reseeding instead of
+# opening an underfunded second quadrant before early crops pay back.
 
 
 @dataclass(frozen=True)
@@ -325,7 +324,7 @@ def _market_orders(
     hour: int,
     plan: FieldPlan,
 ) -> list[list[Any]]:
-    """Sell crops, replenish seeds, schedule hands, and expand crop land."""
+    """Sell crops, replenish seeds, and schedule daily farm hands."""
     del hour  # Hires retry every turn until the daily roster is full.
     orders: list[list[Any]] = []
     shed = _as_dict(private.get("shed"))
@@ -401,18 +400,6 @@ def _market_orders(
             money -= cost
             hires_today += 1
             current_hands += 1
-
-    # Expanding is intentionally conservative: only buy after the currently
-    # unlocked crop field is effectively full and retain a working reserve.
-    unlocked_quadrants = farm.get("unlocked_quadrants", ["NW"])
-    extra_quadrants = max(0, len(unlocked_quadrants) - 1)
-    if extra_quadrants < len(LAND_ORDER) and len(orders) < MAX_MARKET_ORDERS:
-        next_quadrant = LAND_ORDER[extra_quadrants]
-        land_cost = LAND_PRICES[next_quadrant]
-        crop_tiles = sum(plan.crop_active.values())
-        field_is_full = crop_tiles >= plan.field_capacity - 1
-        if field_is_full and money >= land_cost + LAND_CASH_RESERVE:
-            orders.append(["BUY_LAND"])
 
     return orders[:MAX_MARKET_ORDERS]
 

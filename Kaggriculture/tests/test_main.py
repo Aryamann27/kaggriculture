@@ -194,9 +194,9 @@ class MarketOrderTests(unittest.TestCase):
         forbidden = {"BUY_ANIMAL", "BUY_PRODUCT"}
         self.assertFalse(any(order[0] in forbidden for order in orders))
 
-    def test_land_purchase_requires_a_full_crop_field_and_reserve(self) -> None:
+    def test_crop_control_never_spends_market_order_on_land(self) -> None:
         farm = make_farm()
-        farm["money"] = 1600.0
+        farm["money"] = 10000.0
         plan = empty_plan(
             crop_active={"WHEAT": 8, "CARROT": 6, "TOMATO": 7, "MELON": 4},
         )
@@ -210,7 +210,7 @@ class MarketOrderTests(unittest.TestCase):
             plan=plan,
         )
 
-        self.assertIn(["BUY_LAND"], orders)
+        self.assertFalse(any(order[0] == "BUY_LAND" for order in orders))
 
 
 class AgentIntegrationTests(unittest.TestCase):

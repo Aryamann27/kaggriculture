@@ -1,21 +1,14 @@
 """Kaggriculture submission entrypoint.
 
-This strategy runs a hybrid crop-plus-livestock economy. Crops (wheat,
-carrot, tomato, melon) are the primary land use and the funded cash
-engine -- they generate steady revenue from day 2-3 with no ongoing
-dependency. Animals (cow/sheep/goose) get a smaller, dedicated share of
-land and are bought only out of a cash *surplus* above a healthy reserve,
-never out of the starting bank: unlike crops -- which always decay after
-their yield cap and must be replanted -- an animal never decays once placed
-and fed, so it's a one-time capital investment with an indefinite payback,
-but it also needs a steady wheat feed supply or it starves in as little as
-two days. Funding animals from organic crop revenue (rather than an
-upfront capital dump) avoids a boom-bust cash crunch during the ramp-up
-before animals and their own feed wheat mature. Land is purchased once the
-current quadrant's targets are filled and cash allows. Selling is
-price-aware per product, tuned to how hard each one crashes under
-oversupply. The helpers are pure where practical so future policies can be
-improved without changing the Kaggle action protocol.
+This strategy makes a cow-led livestock stack its main mid-season engine.
+It first establishes a dedicated wheat patch, then caps the herd by both
+that live wheat capacity and built structure slots.  Every purchased or
+placed head is backed by several whole days of wheat, rather than a shared
+minimum buffer, so expanding the herd cannot create a starvation cascade.
+The early crop patch funds NE expansion; NE then supplies the additional
+wheat, pastures, and workers needed for a larger herd.  Sheep and geese are
+secondary occupants after cow capacity is funded.  Milk and wool are sold
+only in small, high-price batches to avoid manufacturing a deep glut.
 """
 
 from __future__ import annotations
@@ -25,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-MAX_HANDS = 6
+MAX_HANDS = 11
 SHED_CAPACITY = 100
 FORCE_SELL_DAY = 27
 LAST_HAND_HIRE_DAY = 28
@@ -33,33 +26,39 @@ FINAL_ACTION_DAY = 29
 MAX_MARKET_ORDERS = 10
 SAFETY_BUFFER_DAYS = 2
 
-# Crops get the majority land share as the primary, low-risk cash engine;
-# animals get the remainder plus whatever extra wheat their feed demands.
-CROP_LAND_SHARE = 0.70
-
-MIN_WHEAT_TILES = 4
-# Buffer over the ~0.8 units/tile/day unfertilized wheat rate so feed supply
-# stays ahead of a growing animal population.
-WHEAT_TILES_PER_ANIMAL = 1.5
-# Animals escape after 2 unfed days, but wheat takes 2-4 days to first
-# yield. Require a small wheat buffer in the shed before placing a *new*
-# animal, so it never starts its starvation clock with zero feed available.
-MIN_WHEAT_BUFFER_FOR_PLACEMENT = 3
-# How many days of feed the bootstrap wheat purchase (see _market_orders)
-# tries to keep in reserve for the *entire* current+pending animal
-# population, not just enough for one placement.
-FEED_DAYS_BUFFER = 3
-# Animals are bought only from cash *surplus* above this floor, and only a
-# few per turn -- both exist so buying toward a large deficit can't drain
-# the bank in one shot and starve the population it just bought. Crop
-# revenue (not the starting bank) is meant to fund this reserve growing
-# over time.
-ANIMAL_CASH_RESERVE = 1200
+# A dedicated livestock stack takes 30% of every unlocked field.  The same
+# number of wheat tiles is reserved for its eventual feed supply, leaving
+# the remainder for cash crops.  This is intentionally not based on today's
+# animal count: wheat is planted before the herd is allowed to grow.
+LIVESTOCK_SLOT_RATIO = 0.30
+MIN_WHEAT_TILES = 10
+WHEAT_TILES_PER_ANIMAL = 1.0
+# A crop must already be in the ground before it can underwrite any animal
+# structure or purchase.  Wheat takes days to become useful, so merely
+# having seed money is not a feed source.
+WHEAT_BOOTSTRAP_TILES = 10
+# Keep five complete feedings per committed head in the shed.  This covers
+# movement, harvest/replant gaps, and the two-day escape window without
+# relying on a same-day market rescue.
+FEED_DAYS_BUFFER = 5
+EMERGENCY_FEED_DAYS = 3
+ANIMAL_CASH_RESERVE = 400
 MAX_NEW_ANIMALS_PER_TURN = 2
+FIRST_ANIMAL_BUY_DAY = 2
+# Keep only two empty structures ahead of the committed herd.  Structures
+# are free but consume the same productive tiles needed to finance feed.
+STRUCTURE_HEADROOM = 2
+# Start with six hands for crop establishment; add one per three committed
+# animals, up to eleven hands, so feed/harvest/care work grows with the herd.
+BASE_HANDS = 6
+ANIMALS_PER_ADDITIONAL_HAND = 3
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_PRICES = {"NE": 1000, "SW": 2000, "SE": 4000}
-LAND_CASH_RESERVE = 500
+LAND_CASH_RESERVE = 1200
+EARLY_NE_UTILIZATION_RATIO = 0.60
+EARLY_NE_CASH_RESERVE = 900
+EARLY_NE_MIN_DAY = 1
 
 
 @dataclass(frozen=True)
@@ -75,16 +74,17 @@ class CropSpec:
 
 
 CROPS = {
-    "WHEAT":      CropSpec(10, 2, 4, 6, False, base_price=25, sell_threshold_ratio=0.65, allocation_ratio=0.30),
-    "CARROT":     CropSpec(20, 2, 3, 4, False, base_price=35, sell_threshold_ratio=0.70, allocation_ratio=0.25),
-    "TOMATO":     CropSpec(50, 8, 8, 4, True, base_price=60, sell_threshold_ratio=0.65, allocation_ratio=0.30),
+    "WHEAT":      CropSpec(10, 2, 4, 6, False, base_price=25, sell_threshold_ratio=0.70, allocation_ratio=0.0),
+    "CARROT":     CropSpec(20, 2, 3, 4, False, base_price=35, sell_threshold_ratio=0.75, allocation_ratio=0.45),
+    "TOMATO":     CropSpec(50, 8, 8, 4, True, base_price=60, sell_threshold_ratio=0.70, allocation_ratio=0.35),
     "STRAWBERRY": CropSpec(100, 10, 10, 4, True, base_price=120, sell_threshold_ratio=0.75, allocation_ratio=0.0),
-    "MELON":      CropSpec(80, 10, 12, 6, False, base_price=250, sell_threshold_ratio=0.80, allocation_ratio=0.15),
+    "MELON":      CropSpec(80, 10, 12, 6, False, base_price=250, sell_threshold_ratio=0.85, allocation_ratio=0.20),
 }
 
 # Strawberry is deferred: same capital-intensive, glut-sensitive profile as
 # tomato/melon without adding a distinct risk/return trade-off yet.
 PLANTABLE_CROPS = ["WHEAT", "CARROT", "TOMATO", "MELON"]
+CASH_CROPS = ["CARROT", "TOMATO", "MELON"]
 
 # Plant only if there's enough season left for the crop to mature, produce,
 # and be sold before the engine stops accepting new work.
@@ -109,9 +109,9 @@ class AnimalSpec:
 
 
 ANIMALS = {
-    "COW":   AnimalSpec(400, "PASTURE", 8, 2, 6, base_price=160, sell_threshold_ratio=0.80, allocation_ratio=0.50),
-    "SHEEP": AnimalSpec(500, "PASTURE", 6, 3, 6, base_price=200, sell_threshold_ratio=0.85, allocation_ratio=0.30),
-    "GOOSE": AnimalSpec(300, "COOP", 4, 1, 4, base_price=50, sell_threshold_ratio=0.65, allocation_ratio=0.20),
+    "COW":   AnimalSpec(400, "PASTURE", 8, 2, 6, base_price=160, sell_threshold_ratio=0.92, allocation_ratio=0.75),
+    "SHEEP": AnimalSpec(500, "PASTURE", 6, 3, 6, base_price=200, sell_threshold_ratio=0.95, allocation_ratio=0.20),
+    "GOOSE": AnimalSpec(300, "COOP", 4, 1, 4, base_price=50, sell_threshold_ratio=0.70, allocation_ratio=0.05),
 }
 
 # Priority order for allocation/tie-breaking: cow has the best $/day and the
@@ -145,9 +145,10 @@ for _animal, _product in ANIMAL_PRODUCT.items():
     SELL_SPECS[_product] = (_spec.base_price, _spec.sell_threshold_ratio)
 
 # A single order can walk a glut-sensitive product's price down its steep
-# curve in one shot; capping it lets natural production and town
-# consumption partially refill the market between sales.
-MAX_SELL_PER_TURN = {"MELON": 5, "WOOL": 5}
+# curve in one shot.  Milk and wool wait for a worthwhile batch and then
+# sell only a small tranche, allowing town demand to repair the price.
+MAX_SELL_PER_TURN = {"MELON": 5, "MILK": 4, "WOOL": 3}
+MIN_SELL_BATCH = {"MILK": 4, "WOOL": 3}
 
 
 @dataclass(frozen=True)
@@ -353,10 +354,17 @@ def _allocate_by_ratio(budget: int, keys: list[str], ratio: dict[str, float]) ->
     return targets
 
 
-def _wheat_feed_demand(animal_count: int) -> int:
-    """Tiles of wheat wanted purely to cover animal feed (on top of
-    whatever wheat's normal crop-ratio share already provides)."""
-    return math.ceil(animal_count * WHEAT_TILES_PER_ANIMAL) if animal_count > 0 else 0
+def _feed_supported_herd(wheat_tiles: int) -> int:
+    """Return the herd size that live wheat can safely support.
+
+    The bootstrap floor keeps empty or just-seeded fields from being treated
+    as a feed source.  Animals can remain safely in the shed while a new
+    wheat cycle is planted, but they cannot be bought or placed beyond this
+    cap.
+    """
+    if wheat_tiles < WHEAT_BOOTSTRAP_TILES:
+        return 0
+    return math.floor(wheat_tiles / WHEAT_TILES_PER_ANIMAL)
 
 
 @dataclass(frozen=True)
@@ -367,6 +375,8 @@ class FieldPlan:
     crop_maturing: dict[str, int]
     crop_targets: dict[str, int]
     animal_targets: dict[str, int]
+    wheat_active: int
+    feed_supported_herd: int
     occupied_by_animal: dict[str, int]
     structures_built: dict[str, int]
     empty_structures: dict[str, list[tuple[int, int]]]
@@ -382,33 +392,59 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
     scan = _scan_field(farm, day, positions)
     tasks = list(scan.tasks)
 
-    shed = _as_dict(private.get("shed"))
-    owned_animals_total = sum(int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS)
-    animal_count = sum(scan.occupied_by_animal.values()) + owned_animals_total
-
-    crop_budget = round(field_capacity * CROP_LAND_SHARE)
-    livestock_budget = max(0, field_capacity - crop_budget)
-    crop_targets = _allocate_by_ratio(
-        crop_budget,
-        PLANTABLE_CROPS,
-        {c: CROPS[c].allocation_ratio for c in PLANTABLE_CROPS},
+    livestock_budget = round(field_capacity * LIVESTOCK_SLOT_RATIO)
+    wheat_target = max(
+        MIN_WHEAT_TILES,
+        math.ceil(livestock_budget * WHEAT_TILES_PER_ANIMAL),
     )
-    # Wheat also has to cover animal feed; if that demand exceeds its normal
-    # crop-ratio share, let it claim more of the shared empty-tile
-    # competition below rather than capping it -- a smaller tomato patch is
-    # a much better trade than a starving herd.
-    crop_targets["WHEAT"] = max(
-        MIN_WHEAT_TILES, crop_targets["WHEAT"], _wheat_feed_demand(animal_count)
+    cash_crop_budget = max(0, field_capacity - livestock_budget - wheat_target)
+    crop_targets = {crop: 0 for crop in PLANTABLE_CROPS}
+    crop_targets.update(
+        _allocate_by_ratio(
+            cash_crop_budget,
+            CASH_CROPS,
+            {crop: CROPS[crop].allocation_ratio for crop in CASH_CROPS},
+        )
     )
+    crop_targets["WHEAT"] = wheat_target
 
     animal_targets = _allocate_by_ratio(
         livestock_budget,
         PLANTABLE_ANIMALS,
         {a: ANIMALS[a].allocation_ratio for a in PLANTABLE_ANIMALS},
     )
+    wheat_active = scan.crop_active["WHEAT"]
+    feed_supported_herd = _feed_supported_herd(wheat_active)
+    shed = _as_dict(private.get("shed"))
+    carried_animals = sum(
+        max(0, int(_as_dict(inventory).get(animal, 0)))
+        for inventory in private.get("inventories", [])
+        if isinstance(inventory, dict)
+        for animal in PLANTABLE_ANIMALS
+    )
+    committed_herd = (
+        sum(scan.occupied_by_animal.values())
+        + sum(max(0, int(shed.get(animal, 0))) for animal in PLANTABLE_ANIMALS)
+        + carried_animals
+    )
+    # Structure construction follows established wheat, cow first.  Empty
+    # structures consume land, so build just two slots beyond the committed
+    # herd instead of filling the whole animal allocation before it is paid
+    # for.  This preserves a cash-crop engine through the herd ramp.
+    buildable_slots = min(
+        livestock_budget,
+        feed_supported_herd,
+        committed_herd + STRUCTURE_HEADROOM,
+    )
+    buildable_animal_targets = {animal: 0 for animal in PLANTABLE_ANIMALS}
+    for animal in PLANTABLE_ANIMALS:
+        assigned = min(animal_targets[animal], buildable_slots)
+        buildable_animal_targets[animal] = assigned
+        buildable_slots -= assigned
+
     structure_targets = {kind: 0 for kind in STRUCTURE_KINDS}
     for animal in PLANTABLE_ANIMALS:
-        structure_targets[ANIMALS[animal].structure] += animal_targets[animal]
+        structure_targets[ANIMALS[animal].structure] += buildable_animal_targets[animal]
 
     empty_structures = scan.empty_structures
     unfed_animals = scan.unfed_animals
@@ -466,6 +502,8 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         crop_maturing=scan.crop_maturing,
         crop_targets=crop_targets,
         animal_targets=animal_targets,
+        wheat_active=wheat_active,
+        feed_supported_herd=feed_supported_herd,
         occupied_by_animal=scan.occupied_by_animal,
         structures_built=scan.structures_built,
         empty_structures=empty_structures,
@@ -511,6 +549,16 @@ def _logistics_actions(
     remaining_shed_animals = {a: int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS}
     remaining_shed_wheat = int(shed.get("WHEAT", 0))
     remaining_shed_fertilizer = int(shed.get("FERTILIZER", 0))
+    placed_animals = sum(plan.occupied_by_animal.values())
+    # An animal in a unit inventory has already been committed to a
+    # structure, even though the board has not reflected that placement yet.
+    # Count it before scheduling new pickups so several units cannot consume
+    # one herd-cap slot or one feed buffer at the same time.
+    pending_placements = sum(
+        int(_as_dict(inventories[idx]).get(animal, 0))
+        for idx in range(len(inventories))
+        for animal in PLANTABLE_ANIMALS
+    )
 
     actions: list[list[str] | None] = []
     for idx, position in enumerate(unit_positions):
@@ -519,13 +567,22 @@ def _logistics_actions(
         carried_animal = next((a for a in PLANTABLE_ANIMALS if inv.get(a, 0) > 0), None)
         if carried_animal is not None:
             targets = remaining_structures.get(ANIMALS[carried_animal].structure, [])
-            if not targets:
+            required_feed = (placed_animals + pending_placements) * FEED_DAYS_BUFFER
+            if (
+                not targets
+                or placed_animals + pending_placements > plan.feed_supported_herd
+                or remaining_shed_wheat < required_feed
+            ):
                 actions.append(None)
                 continue
             target = min(targets, key=lambda p: _manhattan(position, p))
+            # Claim the destination while the animal walks; otherwise two
+            # carriers can converge on one empty structure in the same turn.
+            targets.remove(target)
             if position == target:
                 actions.append(["PLACE", carried_animal])
-                targets.remove(target)
+                placed_animals += 1
+                pending_placements -= 1
             else:
                 actions.append(_move_toward(position, target))
             continue
@@ -554,10 +611,13 @@ def _logistics_actions(
                 for a in animal_fill_priority
                 if remaining_shed_animals.get(a, 0) > 0
                 and remaining_structures.get(ANIMALS[a].structure)
-                # Don't start a new animal's starvation clock with no feed
-                # on hand -- wheat takes 2-4 days to first yield, but two
-                # unfed days is fatal.
-                and remaining_shed_wheat >= MIN_WHEAT_BUFFER_FOR_PLACEMENT
+                and placed_animals + pending_placements < plan.feed_supported_herd
+                # Reserve the full buffer for every existing and committed
+                # head, not a reusable three-wheat minimum for the whole
+                # herd.  If this is false the animal remains safely in the
+                # shed until feed is genuinely available.
+                and remaining_shed_wheat
+                >= (placed_animals + pending_placements + 1) * FEED_DAYS_BUFFER
             ),
             None,
         )
@@ -569,6 +629,7 @@ def _logistics_actions(
                 # this turn don't also claim it -- the animal being carried
                 # can't be placed anywhere else.
                 remaining_structures[ANIMALS[animal_choice].structure].pop()
+                pending_placements += 1
             else:
                 actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
             continue
@@ -637,6 +698,25 @@ def _fib(n: int) -> int:
     return first
 
 
+def _carried_animal_counts(private: dict[str, Any]) -> dict[str, int]:
+    """Count animals already carried by field units."""
+    counts = {animal: 0 for animal in PLANTABLE_ANIMALS}
+    inventories = private.get("inventories")
+    if not isinstance(inventories, list):
+        return counts
+    for inventory in inventories:
+        inventory_dict = _as_dict(inventory)
+        for animal in PLANTABLE_ANIMALS:
+            counts[animal] += max(0, int(inventory_dict.get(animal, 0)))
+    return counts
+
+
+def _desired_hand_count(total_animals: int) -> int:
+    """Scale daily staffing with feeding and livestock-care workload."""
+    extra_hands = math.ceil(total_animals / ANIMALS_PER_ADDITIONAL_HAND)
+    return min(MAX_HANDS, BASE_HANDS + extra_hands)
+
+
 def _market_orders(
     farm: dict[str, Any],
     private: dict[str, Any],
@@ -654,28 +734,66 @@ def _market_orders(
 
     force_sell = day >= FORCE_SELL_DAY
     shed_total = sum(shed.values())
-
-    # Wheat doubles as animal feed, so a chunk of it is never for sale: the
-    # sell loop below must reserve this buffer before offering any surplus,
-    # otherwise a high wheat price sells off the very stock animals need
-    # (our own crop takes 2-4+ days to yield, longer than the 2-unfed-day
-    # grace period animals get before they escape).
     occupied_animals = sum(plan.occupied_by_animal.values())
-    owned_unplaced_animals = sum(int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS)
-    total_animals = occupied_animals + owned_unplaced_animals
-    wheat_feed_reserve = (
-        max(MIN_WHEAT_BUFFER_FOR_PLACEMENT, total_animals * FEED_DAYS_BUFFER)
+    carried_animals = _carried_animal_counts(private)
+    unplaced_animals = {
+        animal: max(0, int(shed.get(animal, 0))) + carried_animals[animal]
+        for animal in PLANTABLE_ANIMALS
+    }
+    known_animals = {
+        animal: plan.occupied_by_animal.get(animal, 0) + unplaced_animals[animal]
+        for animal in PLANTABLE_ANIMALS
+    }
+    total_animals = sum(known_animals.values())
+    wheat_feed_reserve = total_animals * FEED_DAYS_BUFFER
+    wheat_price = max(1, int(prices.get("WHEAT", 0)))
+    wheat_stock = max(0, int(shed.get("WHEAT", 0)))
+    # Retain enough cash to fully replace the physical feed buffer once,
+    # even after buying seeds or hands.  This is intentionally separate from
+    # the wheat in the shed: a harvest/replant gap should trigger an orderly
+    # refill, not force a newly purchased herd to consume its last food.
+    cash_floor = (
+        ANIMAL_CASH_RESERVE + total_animals * EMERGENCY_FEED_DAYS * wheat_price
         if total_animals > 0
         else 0
     )
+    # Once the wheat cap and an empty pasture make the next cow legal, do
+    # not let seed or hiring orders consume the first fully funded increment.
+    # This is a reservation, not a speculative purchase: the animal loop
+    # below independently rechecks feed capacity, the slot, and season time.
+    cow_purchase_floor = 0
+    if (
+        day >= FIRST_ANIMAL_BUY_DAY
+        and plan.feed_supported_herd > total_animals
+        and known_animals["COW"] < plan.animal_targets.get("COW", 0)
+        and plan.empty_structures.get("PASTURE")
+    ):
+        cow_purchase_floor = (
+            ANIMALS["COW"].cost
+            + FEED_DAYS_BUFFER * wheat_price
+            + ANIMAL_CASH_RESERVE
+            + EMERGENCY_FEED_DAYS * wheat_price
+        )
+    spending_floor = max(cash_floor, cow_purchase_floor)
+
+    # Feed is the only urgent market action.  It goes first so a crowded
+    # revenue turn cannot silently drop the order that keeps the herd alive.
+    wheat_shortfall = max(0, wheat_feed_reserve - wheat_stock)
+    if wheat_shortfall > 0:
+        affordable_wheat = min(wheat_shortfall, int(money // wheat_price))
+        if affordable_wheat > 0:
+            orders.append(["BUY_PRODUCT", "WHEAT", affordable_wheat])
+            money -= affordable_wheat * wheat_price
+            wheat_stock += affordable_wheat
 
     # Each product sells once its price clears a threshold tuned to how hard
     # it crashes under oversupply, unless the shed is about to overflow or
     # the season is ending and everything has to be liquidated regardless.
-    # Sells are queued before buys and hires so they always get an order slot.
+    # Do not liquidate feed until the final action day: the day-27 cash-out
+    # window still has two end-of-day refreshes in which animals can escape.
     for product, (base_price, threshold_ratio) in SELL_SPECS.items():
         in_shed = int(shed.get(product, 0))
-        if product == "WHEAT" and not force_sell:
+        if product == "WHEAT" and day < FINAL_ACTION_DAY:
             in_shed = max(0, in_shed - wheat_feed_reserve)
         if in_shed <= 0:
             continue
@@ -684,6 +802,9 @@ def _market_orders(
         capacity_pressure = shed_total >= SHED_CAPACITY - plan.field_capacity
         if not (threshold_met or capacity_pressure or force_sell):
             continue
+        min_batch = MIN_SELL_BATCH.get(product, 1)
+        if not force_sell and not capacity_pressure and in_shed < min_batch:
+            continue
 
         quantity = in_shed
         cap = MAX_SELL_PER_TURN.get(product)
@@ -691,106 +812,155 @@ def _market_orders(
             quantity = min(quantity, cap)
         if quantity <= 0:
             continue
+        if len(orders) >= MAX_MARKET_ORDERS:
+            break
         orders.append(["SELL", product, quantity])
         shed_total -= quantity
-
-    # Bootstrap: top up the wheat buffer directly from the market if it's
-    # too thin to safely feed/place animals. Without this, newly bought
-    # animals would sit idle in the shed (or worse, starve once placed)
-    # waiting on a self-grown feed source that hasn't caught up yet. This
-    # should rarely fire in the hybrid model since wheat is also a
-    # ratio-funded crop from day one, not solely demand-driven.
-    if total_animals > 0:
-        wheat_in_shed = int(shed.get("WHEAT", 0))
-        wheat_shortfall = max(0, wheat_feed_reserve - wheat_in_shed)
-        if wheat_shortfall > 0:
-            wheat_price = max(1, int(prices.get("WHEAT", 0)))
-            affordable = min(wheat_shortfall, int(money // wheat_price))
-            if affordable > 0:
-                orders.append(["BUY_PRODUCT", "WHEAT", affordable])
-                money -= affordable * wheat_price
+        money += price * quantity
 
     # Seeds are bought before mature plants are cleared, eliminating an idle
     # turn between a harvest and planting the next cycle for that crop.
     owned_seeds = {crop: max(0, int(seeds.get(crop, 0))) for crop in PLANTABLE_CROPS}
     for crop in PLANTABLE_CROPS:
+        if len(orders) >= MAX_MARKET_ORDERS:
+            break
         if day > LAST_PLANT_DAY[crop]:
             continue
         projected_active = plan.crop_active[crop] - plan.crop_maturing[crop]
         deficit = max(0, plan.crop_targets.get(crop, 0) - projected_active - owned_seeds[crop])
         if deficit <= 0:
             continue
-        affordable = min(deficit, int(money // CROPS[crop].seed_cost))
+        affordable = min(
+            deficit,
+            int(max(0.0, money - spending_floor) // CROPS[crop].seed_cost),
+        )
         if affordable <= 0:
             continue
         orders.append(["BUY_SEED", crop, affordable])
         money -= affordable * CROPS[crop].seed_cost
 
-    # Animals are bought toward their target population minus however many
-    # are already alive or already sitting in the shed awaiting placement,
-    # but only from cash *surplus* above ANIMAL_CASH_RESERVE -- crop revenue,
-    # not the starting bank, is meant to fund this. Each purchase's
-    # *effective* cost also includes its own feed-bootstrap reserve
-    # (FEED_DAYS_BUFFER worth of wheat at the current price), and a small
-    # per-turn cap adds a second, independent brake -- both exist so a large
-    # deficit can't drain the bank in one shot and starve the population it
-    # just bought.
-    animals_bought_this_turn = 0
-    wheat_price_estimate = max(1, int(prices.get("WHEAT", 0)))
-    for animal in PLANTABLE_ANIMALS:
-        if day > LAST_ANIMAL_BUY_DAY[animal] or animals_bought_this_turn >= MAX_NEW_ANIMALS_PER_TURN:
-            continue
-        owned_unplaced = int(shed.get(animal, 0))
-        deficit = max(
-            0,
-            plan.animal_targets.get(animal, 0) - plan.occupied_by_animal.get(animal, 0) - owned_unplaced,
-        )
-        if deficit <= 0:
-            continue
-        remaining_quota = MAX_NEW_ANIMALS_PER_TURN - animals_bought_this_turn
-        effective_cost = ANIMALS[animal].cost + FEED_DAYS_BUFFER * wheat_price_estimate
-        available_cash = max(0.0, money - ANIMAL_CASH_RESERVE)
-        affordable = min(deficit, remaining_quota, int(available_cash // effective_cost))
-        if affordable <= 0:
-            continue
-        orders.append(["BUY_ANIMAL", animal, affordable])
-        money -= affordable * ANIMALS[animal].cost
-        animals_bought_this_turn += affordable
-
-    # Hands disappear each end of day and hires only fill whatever order
-    # budget remains after sells/buys above -- with up to 4 crops and 3
-    # animal products all potentially selling at once, hour 0 alone can be
-    # crowded out of its entire budget some days. Retrying every hour (not
-    # just hour 0) makes this self-healing: any later hour with spare budget
-    # still picks up the remaining hires, rather than going hand-less for
-    # the whole day.
+    # Staffing ramps from six hands to eleven with the committed herd. Hires
+    # precede expansion purchases so a new feed obligation never arrives
+    # without the workers needed to service it.
     if day <= LAST_HAND_HIRE_DAY:
         hires_today = int(farm.get("hires_today", 0))
         current_hands = len(farm.get("hands", []))
-        while current_hands < MAX_HANDS and len(orders) < MAX_MARKET_ORDERS:
+        desired_hands = _desired_hand_count(total_animals)
+        while current_hands < desired_hands and len(orders) < MAX_MARKET_ORDERS:
             cost = _fib(hires_today)
-            if money < cost:
+            if money - cost < spending_floor:
                 break
             orders.append(["HIRE"])
             money -= cost
             hires_today += 1
             current_hands += 1
 
-    # Land is worth buying once the current quadrant is essentially full of
-    # intentional use, extending both the cash-crop engine and the
-    # livestock population's runway.
+    # A purchase requires all three safety gates: active wheat capacity,
+    # an already-built and unreserved matching structure, and enough cash to
+    # buy the animal plus the full five-day food reserve while retaining cash
+    # for ordinary farm operations.  Bought animals therefore never wait in
+    # a crowded shed for a future, hypothetical feed source.
+    remaining_slots = {
+        kind: max(
+            0,
+            len(plan.empty_structures.get(kind, []))
+            - sum(
+                unplaced_animals[animal]
+                for animal in PLANTABLE_ANIMALS
+                if ANIMALS[animal].structure == kind
+            ),
+        )
+        for kind in STRUCTURE_KINDS
+    }
+    animals_bought_this_turn = 0
+    planned_total = total_animals
+    feed_ready = (
+        wheat_stock >= wheat_feed_reserve
+        and plan.feed_supported_herd >= total_animals
+    )
+    for animal in PLANTABLE_ANIMALS:
+        if (
+            not feed_ready
+            or day < FIRST_ANIMAL_BUY_DAY
+            or day > LAST_ANIMAL_BUY_DAY[animal]
+            or animals_bought_this_turn >= MAX_NEW_ANIMALS_PER_TURN
+        ):
+            continue
+        structure = ANIMALS[animal].structure
+        deficit = max(0, plan.animal_targets.get(animal, 0) - known_animals[animal])
+        herd_headroom = max(0, plan.feed_supported_herd - planned_total)
+        quantity = min(
+            deficit,
+            remaining_slots[structure],
+            herd_headroom,
+            MAX_NEW_ANIMALS_PER_TURN - animals_bought_this_turn,
+        )
+        while quantity > 0:
+            required_feed = (planned_total + quantity) * FEED_DAYS_BUFFER
+            extra_wheat = max(0, required_feed - wheat_stock)
+            total_cost = quantity * ANIMALS[animal].cost + extra_wheat * wheat_price
+            next_cash_floor = (
+                ANIMAL_CASH_RESERVE
+                + (planned_total + quantity) * EMERGENCY_FEED_DAYS * wheat_price
+            )
+            required_orders = 1 + int(extra_wheat > 0)
+            if (
+                len(orders) + required_orders <= MAX_MARKET_ORDERS
+                and money - total_cost >= next_cash_floor
+            ):
+                break
+            quantity -= 1
+        if quantity <= 0:
+            continue
+        required_feed = (planned_total + quantity) * FEED_DAYS_BUFFER
+        extra_wheat = max(0, required_feed - wheat_stock)
+        if extra_wheat > 0:
+            orders.append(["BUY_PRODUCT", "WHEAT", extra_wheat])
+            money -= extra_wheat * wheat_price
+            wheat_stock += extra_wheat
+        orders.append(["BUY_ANIMAL", animal, quantity])
+        money -= quantity * ANIMALS[animal].cost
+        known_animals[animal] += quantity
+        planned_total += quantity
+        remaining_slots[structure] -= quantity
+        animals_bought_this_turn += quantity
+
+    # Unlock NE once the wheat bootstrap and 60% utilization prove that the
+    # initial field is operational.  Placing capital behind the first
+    # feed-safe cow comes first; land only spends what remains after that
+    # herd commitment and its emergency cash reserve.
     unlocked_quadrants = farm.get("unlocked_quadrants", ["NW"])
     n_extra_unlocked = max(0, len(unlocked_quadrants) - 1)
     if n_extra_unlocked < len(LAND_ORDER) and len(orders) < MAX_MARKET_ORDERS:
         next_quadrant = LAND_ORDER[n_extra_unlocked]
         land_cost = LAND_PRICES[next_quadrant]
         utilized = sum(plan.crop_active.values()) + sum(plan.structures_built.values())
+        early_ne_ready = (
+            next_quadrant == "NE"
+            and day >= EARLY_NE_MIN_DAY
+            and plan.wheat_active >= WHEAT_BOOTSTRAP_TILES
+            and utilized >= math.ceil(plan.field_capacity * EARLY_NE_UTILIZATION_RATIO)
+        )
         saturated = utilized >= plan.field_capacity - 1
-        if saturated and money >= land_cost + LAND_CASH_RESERVE:
+        post_purchase_floor = (
+            ANIMAL_CASH_RESERVE + planned_total * EMERGENCY_FEED_DAYS * wheat_price
+            if planned_total > 0
+            else 0
+        )
+        reserve = max(
+            post_purchase_floor,
+            EARLY_NE_CASH_RESERVE if next_quadrant == "NE" else LAND_CASH_RESERVE,
+        )
+        foundation_ready = total_animals > 0
+        land_ready = (
+            (early_ne_ready and foundation_ready)
+            or (saturated and (next_quadrant != "NE" or foundation_ready))
+        )
+        if land_ready and money >= land_cost + reserve:
             orders.append(["BUY_LAND"])
             money -= land_cost
 
-    return orders[:MAX_MARKET_ORDERS]
+    return orders
 
 
 def agent(obs: dict[str, Any]) -> dict[str, Any]:

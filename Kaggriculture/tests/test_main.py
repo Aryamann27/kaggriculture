@@ -37,6 +37,8 @@ def empty_plan(**overrides) -> FieldPlan:
         crop_maturing={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
         crop_targets={"WHEAT": 5, "CARROT": 4, "TOMATO": 5, "MELON": 3},
         animal_targets={"COW": 4, "SHEEP": 2, "GOOSE": 1},
+        wheat_active=10,
+        feed_supported_herd=10,
         occupied_by_animal={"COW": 0, "SHEEP": 0, "GOOSE": 0},
         structures_built={"PASTURE": 0, "COOP": 0},
         empty_structures={"PASTURE": [], "COOP": []},
@@ -91,7 +93,7 @@ class HarvestTimingTests(unittest.TestCase):
 
 
 class AllocationTests(unittest.TestCase):
-    def test_empty_field_plants_multiple_crops_and_builds_structures(self) -> None:
+    def test_empty_field_bootstraps_crops_before_building_structures(self) -> None:
         farm = make_farm()
         private = {
             "seeds": {"WHEAT": 25, "CARROT": 25, "TOMATO": 25, "MELON": 25},
@@ -102,9 +104,27 @@ class AllocationTests(unittest.TestCase):
         built_kinds = {t.action[0] for t in plan.tasks if t.action[0].startswith("BUILD_")}
 
         self.assertGreater(len(planted_crops), 1)
-        self.assertEqual(built_kinds, {"BUILD_PASTURE", "BUILD_COOP"})
-        # Crops get the majority land share.
-        self.assertGreater(sum(plan.crop_targets.values()), plan.field_capacity * 0.5)
+        self.assertEqual(built_kinds, set())
+        self.assertEqual(plan.crop_targets["WHEAT"], 10)
+
+    def test_established_wheat_unlocks_cow_first_pastures(self) -> None:
+        farm = make_farm()
+        for x in range(5):
+            for y in range(2):
+                farm["tiles"][y][x] = {
+                    "kind": "PLANT",
+                    "crop": "WHEAT",
+                    "planted_day": 0,
+                    "watered_today": True,
+                    "yield_units": 0,
+                }
+
+        plan = _field_tasks(farm, {"seeds": {}}, day=1)
+        built_kinds = {t.action[0] for t in plan.tasks if t.action[0].startswith("BUILD_")}
+
+        self.assertEqual(plan.feed_supported_herd, 10)
+        self.assertGreater(plan.animal_targets["COW"], plan.animal_targets["SHEEP"])
+        self.assertEqual(built_kinds, {"BUILD_PASTURE"})
 
     def test_cow_and_sheep_share_the_pasture_target(self) -> None:
         farm = make_farm()
@@ -120,7 +140,7 @@ class MarketOrderTests(unittest.TestCase):
     def test_sell_threshold_differs_by_product(self) -> None:
         farm = make_farm()
         private = {"shed": {"WHEAT": 5, "WOOL": 5}, "seeds": {}}
-        # Above wheat's 0.65 threshold ($16.25) but below wool's 0.85 ($170).
+        # Above wheat's 0.70 threshold ($17.50) but below wool's 0.95 ($190).
         market = {"prices": {"WHEAT": 20, "WOOL": 100}}
         plan = empty_plan()
 
@@ -131,32 +151,122 @@ class MarketOrderTests(unittest.TestCase):
 
     def test_wheat_sale_reserves_the_animal_feed_buffer(self) -> None:
         farm = make_farm()
-        private = {"shed": {"WHEAT": 10}, "seeds": {}}
+        private = {"shed": {"WHEAT": 14}, "seeds": {}}
         market = {"prices": {"WHEAT": 30}}  # well above the sell threshold
         plan = empty_plan(occupied_by_animal={"COW": 2, "SHEEP": 0, "GOOSE": 0})
 
         orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
 
         sell_orders = [o for o in orders if o[0] == "SELL" and o[1] == "WHEAT"]
-        # 2 animals * FEED_DAYS_BUFFER(3) = 6 reserved; only the surplus (4) sells.
+        # 2 animals * FEED_DAYS_BUFFER(5) = 10 reserved; only the surplus (4) sells.
         self.assertEqual(sell_orders, [["SELL", "WHEAT", 4]])
 
     def test_animal_purchases_respect_the_cash_reserve(self) -> None:
         farm = make_farm()
-        farm["money"] = 1200.0  # exactly the reserve floor, no surplus
+        farm["money"] = 400.0  # exactly the reserve floor, no surplus
         private = {"shed": {}, "seeds": {}}
         market = {"prices": {"WHEAT": 25}}
-        plan = empty_plan()
+        plan = empty_plan(
+            crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            animal_targets={"COW": 1, "SHEEP": 0, "GOOSE": 0},
+            feed_supported_herd=1,
+            empty_structures={"PASTURE": [(0, 0)], "COOP": []},
+        )
 
         orders = _market_orders(farm, private, market, day=0, hour=1, plan=plan)
 
         self.assertFalse(any(o[0] == "BUY_ANIMAL" for o in orders))
 
+    def test_cow_purchase_prepays_the_full_feed_buffer(self) -> None:
+        farm = make_farm()
+        farm["money"] = 4000.0
+        private = {"shed": {}, "seeds": {}}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(
+            crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            animal_targets={"COW": 2, "SHEEP": 0, "GOOSE": 0},
+            wheat_active=10,
+            feed_supported_herd=2,
+            empty_structures={"PASTURE": [(0, 0), (1, 0)], "COOP": []},
+        )
+
+        orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        self.assertIn(["BUY_PRODUCT", "WHEAT", 10], orders)
+        self.assertIn(["BUY_ANIMAL", "COW", 2], orders)
+
+    def test_animal_purchase_requires_live_wheat_capacity_and_structure_slot(self) -> None:
+        farm = make_farm()
+        farm["money"] = 4000.0
+        private = {"shed": {}, "seeds": {}}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(
+            crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            animal_targets={"COW": 2, "SHEEP": 0, "GOOSE": 0},
+            wheat_active=0,
+            feed_supported_herd=0,
+            empty_structures={"PASTURE": [(0, 0), (1, 0)], "COOP": []},
+        )
+
+        orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        self.assertFalse(any(o[0] == "BUY_ANIMAL" for o in orders))
+
+    def test_animal_purchase_waits_for_crop_bootstrap_days(self) -> None:
+        farm = make_farm()
+        farm["money"] = 4000.0
+        private = {"shed": {}, "seeds": {}}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(
+            crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+            animal_targets={"COW": 2, "SHEEP": 0, "GOOSE": 0},
+            wheat_active=10,
+            feed_supported_herd=2,
+            empty_structures={"PASTURE": [(0, 0), (1, 0)], "COOP": []},
+        )
+
+        orders = _market_orders(farm, private, market, day=1, hour=1, plan=plan)
+
+        self.assertFalse(any(o[0] == "BUY_ANIMAL" for o in orders))
+
+    def test_milk_and_wool_wait_for_strict_sale_batches(self) -> None:
+        farm = make_farm()
+        private = {"shed": {"MILK": 3, "WOOL": 2}, "seeds": {}}
+        market = {"prices": {"MILK": 160, "WOOL": 200}}
+        plan = empty_plan(
+            crop_targets={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
+        )
+
+        orders = _market_orders(farm, private, market, day=10, hour=1, plan=plan)
+
+        self.assertFalse(any(o[0] == "SELL" and o[1] in {"MILK", "WOOL"} for o in orders))
+
+    def test_ne_unlocks_after_feed_bootstrap_before_saturation(self) -> None:
+        farm = make_farm()
+        farm["money"] = 2200.0
+        private = {"shed": {"WHEAT": 5}, "seeds": {}}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(
+            crop_active={"WHEAT": 10, "CARROT": 5, "TOMATO": 0, "MELON": 0},
+            crop_targets={"WHEAT": 10, "CARROT": 5, "TOMATO": 0, "MELON": 0},
+            animal_targets={"COW": 0, "SHEEP": 0, "GOOSE": 0},
+            wheat_active=10,
+            feed_supported_herd=10,
+            occupied_by_animal={"COW": 1, "SHEEP": 0, "GOOSE": 0},
+        )
+
+        orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        self.assertIn(["BUY_LAND"], orders)
+
 
 class LogisticsTests(unittest.TestCase):
     def test_unit_carrying_an_animal_walks_to_and_places_on_its_structure(self) -> None:
         plan = empty_plan(empty_structures={"PASTURE": [(4, 4)], "COOP": []})
-        private = {"inventories": [{"COW": 1}], "shed": {}}
+        private = {"inventories": [{"COW": 1}], "shed": {"WHEAT": 5}}
 
         actions = _logistics_actions(
             unit_positions=[(2, 2)],
@@ -175,6 +285,24 @@ class LogisticsTests(unittest.TestCase):
             animal_fill_priority=["COW", "SHEEP", "GOOSE"],
         )
         self.assertEqual(actions_at_target[0], ["PLACE", "COW"])
+
+    def test_insufficient_full_feed_buffer_keeps_animals_in_the_shed(self) -> None:
+        plan = empty_plan(
+            animal_targets={"COW": 2, "SHEEP": 0, "GOOSE": 0},
+            feed_supported_herd=2,
+            empty_structures={"PASTURE": [(4, 4), (4, 3)], "COOP": []},
+        )
+        private = {"inventories": [{}], "shed": {"COW": 2, "WHEAT": 4}}
+
+        actions = _logistics_actions(
+            unit_positions=[(2, 2)],
+            private=private,
+            board_size=5,
+            plan=plan,
+            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+        )
+
+        self.assertNotEqual(actions[0], ["PICKUP", "COW", 1])
 
     def test_unit_carrying_wheat_feeds_nearest_unfed_animal(self) -> None:
         plan = empty_plan(unfed_animals=[(4, 4)])

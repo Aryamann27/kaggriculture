@@ -1,21 +1,12 @@
 """Kaggriculture submission entrypoint.
 
-This strategy runs a hybrid crop-plus-livestock economy. Crops (wheat,
-carrot, tomato, melon) are the primary land use and the funded cash
-engine -- they generate steady revenue from day 2-3 with no ongoing
-dependency. Animals (cow/sheep/goose) get a smaller, dedicated share of
-land and are bought only out of a cash *surplus* above a healthy reserve,
-never out of the starting bank: unlike crops -- which always decay after
-their yield cap and must be replanted -- an animal never decays once placed
-and fed, so it's a one-time capital investment with an indefinite payback,
-but it also needs a steady wheat feed supply or it starves in as little as
-two days. Funding animals from organic crop revenue (rather than an
-upfront capital dump) avoids a boom-bust cash crunch during the ramp-up
-before animals and their own feed wheat mature. Land is purchased once the
-current quadrant's targets are filled and cash allows. Selling is
-price-aware per product, tuned to how hard each one crashes under
-oversupply. The helpers are pure where practical so future policies can be
-improved without changing the Kaggle action protocol.
+This candidate tests a tomato-centered, ongoing-production pipeline. Wheat
+provides a protected feed reserve for a deliberately capped two-goose flock;
+the geese supply eggs plus the fertilizer routed to tomatoes on their
+scheduled production days. This keeps the animal footprint small, avoids an
+open-ended livestock ramp, and trades frequent replanting for a coordinated
+water/fertilizer/harvest cycle. Strawberry is a small, conditional add-on only
+after town demand, sufficient cash, and enough remaining season align.
 """
 
 from __future__ import annotations
@@ -33,29 +24,31 @@ FINAL_ACTION_DAY = 29
 MAX_MARKET_ORDERS = 10
 SAFETY_BUFFER_DAYS = 2
 
-# Crops get the majority land share as the primary, low-risk cash engine;
-# animals get the remainder plus whatever extra wheat their feed demands.
-CROP_LAND_SHARE = 0.70
+# Most tiles grow the ongoing-crop pipeline; the small remainder leaves room
+# for the fixed goose flock. The target is capped separately below so opening
+# more land never triggers an animal stack.
+CROP_LAND_SHARE = 0.88
 
-MIN_WHEAT_TILES = 4
-# Buffer over the ~0.8 units/tile/day unfertilized wheat rate so feed supply
-# stays ahead of a growing animal population.
-WHEAT_TILES_PER_ANIMAL = 1.5
-# Animals escape after 2 unfed days, but wheat takes 2-4 days to first
-# yield. Require a small wheat buffer in the shed before placing a *new*
-# animal, so it never starts its starvation clock with zero feed available.
-MIN_WHEAT_BUFFER_FOR_PLACEMENT = 3
-# How many days of feed the bootstrap wheat purchase (see _market_orders)
-# tries to keep in reserve for the *entire* current+pending animal
-# population, not just enough for one placement.
-FEED_DAYS_BUFFER = 3
-# Animals are bought only from cash *surplus* above this floor, and only a
-# few per turn -- both exist so buying toward a large deficit can't drain
-# the bank in one shot and starve the population it just bought. Crop
-# revenue (not the starting bank) is meant to fund this reserve growing
-# over time.
-ANIMAL_CASH_RESERVE = 1200
-MAX_NEW_ANIMALS_PER_TURN = 2
+MIN_WHEAT_TILES = 6
+WHEAT_TILES_PER_ANIMAL = 2.0
+GOOSE_FLOCK_CAP = 2
+# A full four-day feed reserve is required before *either* goose is placed.
+# This allows both geese to be fed while wheat is still maturing and makes a
+# missed pickup/logistics turn non-fatal.
+FEED_DAYS_BUFFER = 4
+MIN_WHEAT_BUFFER_FOR_PLACEMENT = GOOSE_FLOCK_CAP * FEED_DAYS_BUFFER
+ANIMAL_CASH_RESERVE = 1400
+MAX_NEW_ANIMALS_PER_TURN = 1
+
+STRAWBERRY_MAX_TILES = 2
+STRAWBERRY_CASH_RESERVE = 2500
+LAST_STRAWBERRY_START_DAY = 14
+STRAWBERRY_DEMAND_SHOPS = {
+    "BRUNCH_SPOT",
+    "ICE_CREAM_SHOP",
+    "SMOOTHIE_SHOP",
+    "FARMERS_MARKET",
+}
 
 LAND_ORDER = ["NE", "SW", "SE"]
 LAND_PRICES = {"NE": 1000, "SW": 2000, "SE": 4000}
@@ -69,22 +62,23 @@ class CropSpec:
     max_yield_day: int
     max_yield: int
     ongoing: bool
+    production_interval: int
     base_price: int
     sell_threshold_ratio: float  # sell once price >= ratio * base_price
     allocation_ratio: float  # share of the *crop* tile budget
 
 
 CROPS = {
-    "WHEAT":      CropSpec(10, 2, 4, 6, False, base_price=25, sell_threshold_ratio=0.65, allocation_ratio=0.30),
-    "CARROT":     CropSpec(20, 2, 3, 4, False, base_price=35, sell_threshold_ratio=0.70, allocation_ratio=0.25),
-    "TOMATO":     CropSpec(50, 8, 8, 4, True, base_price=60, sell_threshold_ratio=0.65, allocation_ratio=0.30),
-    "STRAWBERRY": CropSpec(100, 10, 10, 4, True, base_price=120, sell_threshold_ratio=0.75, allocation_ratio=0.0),
-    "MELON":      CropSpec(80, 10, 12, 6, False, base_price=250, sell_threshold_ratio=0.80, allocation_ratio=0.15),
+    "WHEAT":      CropSpec(10, 2, 4, 6, False, 0, base_price=25, sell_threshold_ratio=0.65, allocation_ratio=0.30),
+    "CARROT":     CropSpec(20, 2, 3, 4, False, 0, base_price=35, sell_threshold_ratio=0.70, allocation_ratio=0.00),
+    "TOMATO":     CropSpec(50, 8, 8, 4, True, 1, base_price=60, sell_threshold_ratio=0.65, allocation_ratio=0.70),
+    "STRAWBERRY": CropSpec(100, 10, 10, 4, True, 2, base_price=120, sell_threshold_ratio=0.75, allocation_ratio=0.00),
+    "MELON":      CropSpec(80, 10, 12, 6, False, 0, base_price=250, sell_threshold_ratio=0.80, allocation_ratio=0.00),
 }
 
-# Strawberry is deferred: same capital-intensive, glut-sensitive profile as
-# tomato/melon without adding a distinct risk/return trade-off yet.
-PLANTABLE_CROPS = ["WHEAT", "CARROT", "TOMATO", "MELON"]
+# Wheat is feed infrastructure and tomato is the cash engine. Strawberry is
+# included only so its dynamically enabled target can be planted and sold.
+PLANTABLE_CROPS = ["WHEAT", "TOMATO", "STRAWBERRY"]
 
 # Plant only if there's enough season left for the crop to mature, produce,
 # and be sold before the engine stops accepting new work.
@@ -94,6 +88,9 @@ LAST_PLANT_DAY = {
     - SAFETY_BUFFER_DAYS
     for crop, spec in CROPS.items()
 }
+LAST_PLANT_DAY["STRAWBERRY"] = min(
+    LAST_PLANT_DAY["STRAWBERRY"], LAST_STRAWBERRY_START_DAY
+)
 
 
 @dataclass(frozen=True)
@@ -114,11 +111,12 @@ ANIMALS = {
     "GOOSE": AnimalSpec(300, "COOP", 4, 1, 4, base_price=50, sell_threshold_ratio=0.65, allocation_ratio=0.20),
 }
 
-# Priority order for allocation/tie-breaking: cow has the best $/day and the
-# fastest capital payback, then sheep, then goose.
-PLANTABLE_ANIMALS = ["COW", "SHEEP", "GOOSE"]
+# Geese are intentionally the whole animal plan: two daily fertilizer units
+# are enough to test the tomato synergy without turning the branch into an
+# indefinite livestock accumulator.
+PLANTABLE_ANIMALS = ["GOOSE"]
 ANIMAL_PRODUCT = {"COW": "MILK", "SHEEP": "WOOL", "GOOSE": "EGG"}
-STRUCTURE_KINDS = ["PASTURE", "COOP"]
+STRUCTURE_KINDS = ["COOP"]
 
 # Buy only if there's enough season left for the animal to reach its first
 # production before the engine stops accepting new work.
@@ -141,13 +139,14 @@ SELL_SPECS: dict[str, tuple[int, float]] = {
     crop: (CROPS[crop].base_price, CROPS[crop].sell_threshold_ratio) for crop in PLANTABLE_CROPS
 }
 for _animal, _product in ANIMAL_PRODUCT.items():
-    _spec = ANIMALS[_animal]
-    SELL_SPECS[_product] = (_spec.base_price, _spec.sell_threshold_ratio)
+    if _animal in PLANTABLE_ANIMALS:
+        _spec = ANIMALS[_animal]
+        SELL_SPECS[_product] = (_spec.base_price, _spec.sell_threshold_ratio)
 
 # A single order can walk a glut-sensitive product's price down its steep
 # curve in one shot; capping it lets natural production and town
 # consumption partially refill the market between sales.
-MAX_SELL_PER_TURN = {"MELON": 5, "WOOL": 5}
+MAX_SELL_PER_TURN = {"STRAWBERRY": 4}
 
 
 @dataclass(frozen=True)
@@ -159,6 +158,23 @@ class Task:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _unplaced_animal_count(private: dict[str, Any], animal: str) -> int:
+    """Count an animal in the shed *or* a unit inventory.
+
+    An animal takes several turns to carry from shed to coop. Counting only
+    the shed during that transit makes market planning buy a duplicate goose
+    even though the flock is already at target.
+    """
+    shed = _as_dict(private.get("shed"))
+    inventories = private.get("inventories")
+    carried = (
+        sum(max(0, int(_as_dict(inv).get(animal, 0))) for inv in inventories)
+        if isinstance(inventories, list)
+        else 0
+    )
+    return max(0, int(shed.get(animal, 0))) + carried
 
 
 def _tile_at(farm: dict[str, Any], position: tuple[int, int]) -> Any:
@@ -230,7 +246,27 @@ class FieldScan:
     weeds: list[tuple[int, int]]
     empty_structures: dict[str, list[tuple[int, int]]]
     unfed_animals: list[tuple[int, int]]
-    fertilizable_wheat: list[tuple[int, int]]
+    fertilizable_ongoing: list[tuple[int, int]]
+
+
+def _produces_at_end_of_day(
+    tile: dict[str, Any], spec: CropSpec, day: int
+) -> bool:
+    """Whether this ongoing crop will produce during today's refresh.
+
+    The engine evaluates the refresh at ``day + 1``. Fertilizer must be
+    applied and the plant watered before that refresh; for tomatoes this is
+    each day of their four-production window, while strawberries produce
+    every other day.
+    """
+    if not spec.ongoing or spec.production_interval <= 0:
+        return False
+    next_day_age = day + 1 - int(tile.get("planted_day", day))
+    days_since_first = next_day_age - spec.first_yield_day
+    return (
+        0 <= days_since_first < spec.max_yield * spec.production_interval
+        and days_since_first % spec.production_interval == 0
+    )
 
 
 def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]) -> FieldScan:
@@ -251,7 +287,8 @@ def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]
     weeds: list[tuple[int, int]] = []
     empty_structures: dict[str, list[tuple[int, int]]] = {kind: [] for kind in STRUCTURE_KINDS}
     unfed_animals: list[tuple[int, int]] = []
-    fertilizable_wheat: list[tuple[int, int]] = []
+    fertilizable_tomatoes: list[tuple[int, int]] = []
+    fertilizable_strawberries: list[tuple[int, int]] = []
 
     for position in positions:
         tile = _tile_at(farm, position)
@@ -282,19 +319,27 @@ def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]
                 if not spec.ongoing and age >= spec.max_yield_day:
                     crop_maturing[crop] += 1
 
-            if (
-                crop == "WHEAT"
-                and yield_units < spec.max_yield
-                and age < spec.max_yield_day
-                and int(tile.get("fertilized_until_day", -1)) < day
-            ):
-                fertilizable_wheat.append(position)
-
             # Care comes first.  This avoids losing crops to the day refresh
             # and lets one-time crops receive their current-day yield bonus.
             needs_water = not watered and (spec.ongoing or age <= spec.max_yield_day)
             if needs_water:
-                tasks.append(Task(100, position, ["WATER"]))
+                tasks.append(Task(120, position, ["WATER"]))
+
+            # Fertilizer has its greatest marginal value on an ongoing crop
+            # exactly when today's refresh will produce. Route the small
+            # goose-created supply to tomatoes first; strawberry receives it
+            # only after every eligible tomato has a target. WATER tasks
+            # above are deliberately higher priority so the refresh sees
+            # both prerequisites.
+            if (
+                spec.ongoing
+                and _produces_at_end_of_day(tile, spec, day)
+                and int(tile.get("fertilized_until_day", -1)) < day
+            ):
+                if crop == "TOMATO":
+                    fertilizable_tomatoes.append(position)
+                elif crop == "STRAWBERRY":
+                    fertilizable_strawberries.append(position)
 
             mature = age >= spec.first_yield_day
             if spec.ongoing:
@@ -308,7 +353,7 @@ def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]
                 cap_reached = yield_units >= spec.max_yield
                 can_harvest = yield_units > 0 and mature and (bonus_window_closed or cap_reached)
             if can_harvest:
-                tasks.append(Task(90, position, ["HARVEST"]))
+                tasks.append(Task(110, position, ["HARVEST"]))
             continue
 
         if kind in STRUCTURE_KINDS:
@@ -321,11 +366,14 @@ def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]
             if not tile.get("fed_today", False):
                 unfed_animals.append(position)
             if tile.get("yield_units", 0) > 0:
-                tasks.append(Task(90, position, ["HARVEST"]))
+                tasks.append(Task(110, position, ["HARVEST"]))
             if not tile.get("cared_today", False):
-                tasks.append(Task(70, position, ["CARE"]))
+                # The installed game awards +1 (not the stale public +2)
+                # when a goose is both cared for and fed. CARE remains worth
+                # doing, but never ahead of basic crop watering or feeding.
+                tasks.append(Task(90, position, ["CARE"]))
             if tile.get("fertilizer_available", False):
-                tasks.append(Task(60, position, ["COLLECT_FERTILIZER"]))
+                tasks.append(Task(100, position, ["COLLECT_FERTILIZER"]))
             continue
 
     return FieldScan(
@@ -338,7 +386,7 @@ def _scan_field(farm: dict[str, Any], day: int, positions: list[tuple[int, int]]
         weeds=weeds,
         empty_structures=empty_structures,
         unfed_animals=unfed_animals,
-        fertilizable_wheat=fertilizable_wheat,
+        fertilizable_ongoing=fertilizable_tomatoes + fertilizable_strawberries,
     )
 
 
@@ -371,10 +419,36 @@ class FieldPlan:
     structures_built: dict[str, int]
     empty_structures: dict[str, list[tuple[int, int]]]
     unfed_animals: list[tuple[int, int]]
-    fertilizable_wheat: list[tuple[int, int]]
+    fertilizable_ongoing: list[tuple[int, int]]
 
 
-def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> FieldPlan:
+def _strawberry_target(
+    farm: dict[str, Any],
+    private: dict[str, Any],
+    town: dict[str, Any],
+    day: int,
+    scan: FieldScan,
+    crop_budget: int,
+) -> int:
+    """Return a small strawberry allocation only for a viable town window."""
+    unlocked_shops = set(town.get("unlocked_shops", []))
+    has_town_demand = bool(unlocked_shops & STRAWBERRY_DEMAND_SHOPS)
+    seeds = _as_dict(private.get("seeds"))
+    committed = scan.crop_active["STRAWBERRY"] > 0 or int(seeds.get("STRAWBERRY", 0)) > 0
+    can_start = day <= LAST_STRAWBERRY_START_DAY
+    can_afford = float(farm.get("money", 0)) >= STRAWBERRY_CASH_RESERVE
+
+    if not can_start or not has_town_demand or not (can_afford or committed):
+        return 0
+    return min(STRAWBERRY_MAX_TILES, max(1, crop_budget // 12))
+
+
+def _field_tasks(
+    farm: dict[str, Any],
+    private: dict[str, Any],
+    day: int,
+    town: dict[str, Any] | None = None,
+) -> FieldPlan:
     """Build all current position-based unit tasks and the counts needed for
     market planning."""
     positions = _unlocked_positions(farm)
@@ -383,7 +457,9 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
     tasks = list(scan.tasks)
 
     shed = _as_dict(private.get("shed"))
-    owned_animals_total = sum(int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS)
+    owned_animals_total = sum(
+        _unplaced_animal_count(private, animal) for animal in PLANTABLE_ANIMALS
+    )
     animal_count = sum(scan.occupied_by_animal.values()) + owned_animals_total
 
     crop_budget = round(field_capacity * CROP_LAND_SHARE)
@@ -401,18 +477,27 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         MIN_WHEAT_TILES, crop_targets["WHEAT"], _wheat_feed_demand(animal_count)
     )
 
-    animal_targets = _allocate_by_ratio(
-        livestock_budget,
-        PLANTABLE_ANIMALS,
-        {a: ANIMALS[a].allocation_ratio for a in PLANTABLE_ANIMALS},
+    strawberry_target = _strawberry_target(
+        farm, private, _as_dict(town), day, scan, crop_budget
     )
+    # Strawberry is an optional replacement for a small number of tomatoes,
+    # not additional land pressure. Retain an existing crop even if the cash
+    # balance subsequently dips below the admission reserve.
+    crop_targets["STRAWBERRY"] = strawberry_target
+    crop_targets["TOMATO"] = max(0, crop_targets["TOMATO"] - strawberry_target)
+
+    # Do not scale animals with field size. The whole fertility experiment is
+    # a fixed flock whose output can be routed, measured, and compared.
+    animal_targets = {
+        "GOOSE": min(GOOSE_FLOCK_CAP, livestock_budget),
+    }
     structure_targets = {kind: 0 for kind in STRUCTURE_KINDS}
     for animal in PLANTABLE_ANIMALS:
         structure_targets[ANIMALS[animal].structure] += animal_targets[animal]
 
     empty_structures = scan.empty_structures
     unfed_animals = scan.unfed_animals
-    fertilizable_wheat = scan.fertilizable_wheat
+    fertilizable_ongoing = scan.fertilizable_ongoing
 
     if day < FINAL_ACTION_DAY:
         # The engine stops before any turn after the last day's inventory
@@ -457,7 +542,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         tasks = []
         empty_structures = {kind: [] for kind in STRUCTURE_KINDS}
         unfed_animals = []
-        fertilizable_wheat = []
+        fertilizable_ongoing = []
 
     return FieldPlan(
         tasks=tasks,
@@ -470,7 +555,7 @@ def _field_tasks(farm: dict[str, Any], private: dict[str, Any], day: int) -> Fie
         structures_built=scan.structures_built,
         empty_structures=empty_structures,
         unfed_animals=unfed_animals,
-        fertilizable_wheat=fertilizable_wheat,
+        fertilizable_ongoing=fertilizable_ongoing,
     )
 
 
@@ -507,7 +592,9 @@ def _logistics_actions(
 
     remaining_structures = {kind: list(positions) for kind, positions in plan.empty_structures.items()}
     remaining_unfed = list(plan.unfed_animals)
-    remaining_fertilizable = list(plan.fertilizable_wheat)
+    # `_scan_field` orders this tomato-first, then strawberry. Do not spend
+    # scarce goose fertilizer on wheat or any non-production-day crop.
+    remaining_fertilizable = list(plan.fertilizable_ongoing)
     remaining_shed_animals = {a: int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS}
     remaining_shed_wheat = int(shed.get("WHEAT", 0))
     remaining_shed_fertilizer = int(shed.get("FERTILIZER", 0))
@@ -532,20 +619,46 @@ def _logistics_actions(
 
         if int(inv.get("WHEAT", 0)) > 0 and remaining_unfed:
             target = min(remaining_unfed, key=lambda p: _manhattan(position, p))
+            # Reserve the target while moving, not only upon arrival. This
+            # keeps separate hands from walking the same wheat to one goose.
+            remaining_unfed.remove(target)
             if position == target:
                 actions.append(["FEED"])
-                remaining_unfed.remove(target)
             else:
                 actions.append(_move_toward(position, target))
             continue
 
         if int(inv.get("FERTILIZER", 0)) > 0 and remaining_fertilizable:
             target = min(remaining_fertilizable, key=lambda p: _manhattan(position, p))
+            # The target list is per-turn shared state; claim on dispatch so
+            # parallel hands fan out across scheduled tomato production.
+            remaining_fertilizable.remove(target)
             if position == target:
                 actions.append(["FERTILIZE"])
-                remaining_fertilizable.remove(target)
             else:
                 actions.append(_move_toward(position, target))
+            continue
+
+        if remaining_unfed and remaining_shed_wheat > 0:
+            if _is_shed_adjacent(position, board_size):
+                actions.append(["PICKUP", "WHEAT", 1])
+                remaining_shed_wheat -= 1
+                # Each hand takes one unit so two geese can be fed in
+                # parallel rather than one courier making a multi-turn loop.
+                remaining_unfed.pop(0)
+            else:
+                actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
+            continue
+
+        if remaining_fertilizable and remaining_shed_fertilizer > 0:
+            if _is_shed_adjacent(position, board_size):
+                actions.append(["PICKUP", "FERTILIZER", 1])
+                remaining_shed_fertilizer -= 1
+                # Parallel one-unit dispatch gives each fertilizer a chance
+                # to land before the current production refresh.
+                remaining_fertilizable.pop(0)
+            else:
+                actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
             continue
 
         animal_choice = next(
@@ -554,9 +667,8 @@ def _logistics_actions(
                 for a in animal_fill_priority
                 if remaining_shed_animals.get(a, 0) > 0
                 and remaining_structures.get(ANIMALS[a].structure)
-                # Don't start a new animal's starvation clock with no feed
-                # on hand -- wheat takes 2-4 days to first yield, but two
-                # unfed days is fatal.
+                # Never place a new goose without enough wheat for the
+                # complete fixed flock's reserve.
                 and remaining_shed_wheat >= MIN_WHEAT_BUFFER_FOR_PLACEMENT
             ),
             None,
@@ -569,28 +681,6 @@ def _logistics_actions(
                 # this turn don't also claim it -- the animal being carried
                 # can't be placed anywhere else.
                 remaining_structures[ANIMALS[animal_choice].structure].pop()
-            else:
-                actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
-            continue
-
-        if remaining_unfed and remaining_shed_wheat > 0:
-            if _is_shed_adjacent(position, board_size):
-                take = min(remaining_shed_wheat, len(remaining_unfed))
-                actions.append(["PICKUP", "WHEAT", take])
-                remaining_shed_wheat -= take
-                # Claim these animals as this unit's to feed, so other idle
-                # units this same turn don't also fetch wheat for them.
-                del remaining_unfed[:take]
-            else:
-                actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
-            continue
-
-        if remaining_fertilizable and remaining_shed_fertilizer > 0:
-            if _is_shed_adjacent(position, board_size):
-                take = min(remaining_shed_fertilizer, len(remaining_fertilizable))
-                actions.append(["PICKUP", "FERTILIZER", take])
-                remaining_shed_fertilizer -= take
-                del remaining_fertilizable[:take]
             else:
                 actions.append(_move_toward(position, _nearest_shed_tile(position, board_size)))
             continue
@@ -661,7 +751,9 @@ def _market_orders(
     # (our own crop takes 2-4+ days to yield, longer than the 2-unfed-day
     # grace period animals get before they escape).
     occupied_animals = sum(plan.occupied_by_animal.values())
-    owned_unplaced_animals = sum(int(shed.get(a, 0)) for a in PLANTABLE_ANIMALS)
+    owned_unplaced_animals = sum(
+        _unplaced_animal_count(private, animal) for animal in PLANTABLE_ANIMALS
+    )
     total_animals = occupied_animals + owned_unplaced_animals
     wheat_feed_reserve = (
         max(MIN_WHEAT_BUFFER_FOR_PLACEMENT, total_animals * FEED_DAYS_BUFFER)
@@ -740,7 +832,7 @@ def _market_orders(
     for animal in PLANTABLE_ANIMALS:
         if day > LAST_ANIMAL_BUY_DAY[animal] or animals_bought_this_turn >= MAX_NEW_ANIMALS_PER_TURN:
             continue
-        owned_unplaced = int(shed.get(animal, 0))
+        owned_unplaced = _unplaced_animal_count(private, animal)
         deficit = max(
             0,
             plan.animal_targets.get(animal, 0) - plan.occupied_by_animal.get(animal, 0) - owned_unplaced,
@@ -776,16 +868,21 @@ def _market_orders(
             hires_today += 1
             current_hands += 1
 
-    # Land is worth buying once the current quadrant is essentially full of
-    # intentional use, extending both the cash-crop engine and the
-    # livestock population's runway.
+    # Land is worth buying once the current target is filled. This uses the
+    # policy target rather than all physical tiles because the goose flock is
+    # intentionally capped; otherwise its unused livestock budget would
+    # permanently block expansion.
     unlocked_quadrants = farm.get("unlocked_quadrants", ["NW"])
     n_extra_unlocked = max(0, len(unlocked_quadrants) - 1)
     if n_extra_unlocked < len(LAND_ORDER) and len(orders) < MAX_MARKET_ORDERS:
         next_quadrant = LAND_ORDER[n_extra_unlocked]
         land_cost = LAND_PRICES[next_quadrant]
         utilized = sum(plan.crop_active.values()) + sum(plan.structures_built.values())
-        saturated = utilized >= plan.field_capacity - 1
+        target_occupancy = sum(
+            max(plan.crop_active[crop], plan.crop_targets[crop])
+            for crop in PLANTABLE_CROPS
+        ) + sum(plan.animal_targets.values())
+        saturated = utilized >= target_occupancy - 1
         if saturated and money >= land_cost + LAND_CASH_RESERVE:
             orders.append(["BUY_LAND"])
             money -= land_cost
@@ -803,6 +900,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     farm = _as_dict(farms[player])
     private = _as_dict(obs.get("private"))
     market = _as_dict(obs.get("market"))
+    town = _as_dict(obs.get("town"))
     day = int(obs.get("day", 0))
     hour = int(obs.get("hour", 0))
     board_size = len(farm.get("tiles", []))
@@ -810,7 +908,7 @@ def agent(obs: dict[str, Any]) -> dict[str, Any]:
     hand_positions = [tuple(position) for position in farm.get("hands", [])]
     unit_positions = [farmer_position, *hand_positions]
 
-    plan = _field_tasks(farm, private, day)
+    plan = _field_tasks(farm, private, day, town)
     fill_priority = _animal_fill_priority(plan)
     logistics = _logistics_actions(unit_positions, private, board_size, plan, fill_priority)
 

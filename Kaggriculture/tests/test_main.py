@@ -7,7 +7,7 @@ import unittest
 from kaggle_environments import make
 
 from main import (
-    ANIMALS,
+    ANIMAL_CASH_RESERVE,
     FieldPlan,
     _field_tasks,
     _logistics_actions,
@@ -33,15 +33,15 @@ def empty_plan(**overrides) -> FieldPlan:
     base = dict(
         tasks=[],
         field_capacity=25,
-        crop_active={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
-        crop_maturing={"WHEAT": 0, "CARROT": 0, "TOMATO": 0, "MELON": 0},
-        crop_targets={"WHEAT": 5, "CARROT": 4, "TOMATO": 5, "MELON": 3},
-        animal_targets={"COW": 4, "SHEEP": 2, "GOOSE": 1},
-        occupied_by_animal={"COW": 0, "SHEEP": 0, "GOOSE": 0},
-        structures_built={"PASTURE": 0, "COOP": 0},
-        empty_structures={"PASTURE": [], "COOP": []},
+        crop_active={"WHEAT": 0, "TOMATO": 0, "STRAWBERRY": 0},
+        crop_maturing={"WHEAT": 0, "TOMATO": 0, "STRAWBERRY": 0},
+        crop_targets={"WHEAT": 7, "TOMATO": 15, "STRAWBERRY": 0},
+        animal_targets={"GOOSE": 2},
+        occupied_by_animal={"GOOSE": 0},
+        structures_built={"COOP": 0},
+        empty_structures={"COOP": []},
         unfed_animals=[],
-        fertilizable_wheat=[],
+        fertilizable_ongoing=[],
     )
     base.update(overrides)
     return FieldPlan(**base)
@@ -91,29 +91,85 @@ class HarvestTimingTests(unittest.TestCase):
 
 
 class AllocationTests(unittest.TestCase):
-    def test_empty_field_plants_multiple_crops_and_builds_structures(self) -> None:
+    def test_empty_field_builds_a_tomato_pipeline_and_coops(self) -> None:
         farm = make_farm()
         private = {
-            "seeds": {"WHEAT": 25, "CARROT": 25, "TOMATO": 25, "MELON": 25},
+            "seeds": {"WHEAT": 25, "TOMATO": 25, "STRAWBERRY": 25},
         }
         plan = _field_tasks(farm, private, day=0)
 
         planted_crops = {t.action[1] for t in plan.tasks if t.action[0] == "PLANT"}
         built_kinds = {t.action[0] for t in plan.tasks if t.action[0].startswith("BUILD_")}
 
-        self.assertGreater(len(planted_crops), 1)
-        self.assertEqual(built_kinds, {"BUILD_PASTURE", "BUILD_COOP"})
-        # Crops get the majority land share.
+        self.assertEqual(planted_crops, {"WHEAT", "TOMATO"})
+        self.assertEqual(built_kinds, {"BUILD_COOP"})
+        self.assertGreater(plan.crop_targets["TOMATO"], plan.crop_targets["WHEAT"])
         self.assertGreater(sum(plan.crop_targets.values()), plan.field_capacity * 0.5)
 
-    def test_cow_and_sheep_share_the_pasture_target(self) -> None:
-        farm = make_farm()
+    def test_goose_target_is_capped_when_more_land_unlocks(self) -> None:
+        farm = make_farm(size=10)
         plan = _field_tasks(farm, {"seeds": {}}, day=0)
-        pasture_target = plan.animal_targets["COW"] + plan.animal_targets["SHEEP"]
-        self.assertGreater(pasture_target, 0)
-        self.assertEqual(ANIMALS["COW"].structure, "PASTURE")
-        self.assertEqual(ANIMALS["SHEEP"].structure, "PASTURE")
-        self.assertEqual(ANIMALS["GOOSE"].structure, "COOP")
+
+        self.assertEqual(plan.animal_targets, {"GOOSE": 2})
+
+    def test_strawberry_needs_town_demand_and_cash(self) -> None:
+        farm = make_farm()
+        private = {"seeds": {}}
+
+        without_demand = _field_tasks(farm, private, day=3, town={"unlocked_shops": []})
+        with_demand = _field_tasks(
+            farm,
+            private,
+            day=3,
+            town={"unlocked_shops": ["FARMERS_MARKET"]},
+        )
+
+        self.assertEqual(without_demand.crop_targets["STRAWBERRY"], 0)
+        self.assertGreater(with_demand.crop_targets["STRAWBERRY"], 0)
+
+
+class FertilizerRoutingTests(unittest.TestCase):
+    def test_tomatoes_precede_strawberries_on_production_days(self) -> None:
+        farm = make_farm()
+        farm["tiles"][0][0] = {
+            "kind": "PLANT",
+            "crop": "TOMATO",
+            "planted_day": 0,
+            "watered_today": False,
+            "yield_units": 0,
+            "fertilized_until_day": -1,
+        }
+        farm["tiles"][1][0] = {
+            "kind": "PLANT",
+            "crop": "STRAWBERRY",
+            "planted_day": 0,
+            "watered_today": False,
+            "yield_units": 0,
+            "fertilized_until_day": -1,
+        }
+
+        plan = _field_tasks(farm, {"seeds": {}}, day=9)
+
+        self.assertEqual(plan.fertilizable_ongoing, [(0, 0), (0, 1)])
+        water_targets = {task.position for task in plan.tasks if task.action == ["WATER"]}
+        self.assertTrue({(0, 0), (0, 1)} <= water_targets)
+
+    def test_fertilizer_carriers_dispatch_to_distinct_targets(self) -> None:
+        plan = empty_plan(fertilizable_ongoing=[(4, 2), (2, 4)])
+        private = {
+            "inventories": [{"FERTILIZER": 1}, {"FERTILIZER": 1}],
+            "shed": {},
+        }
+
+        actions = _logistics_actions(
+            unit_positions=[(2, 2), (2, 2)],
+            private=private,
+            board_size=5,
+            plan=plan,
+            animal_fill_priority=["GOOSE"],
+        )
+
+        self.assertEqual(actions, [["EAST"], ["SOUTH"]])
 
 
 class MarketOrderTests(unittest.TestCase):
@@ -133,17 +189,17 @@ class MarketOrderTests(unittest.TestCase):
         farm = make_farm()
         private = {"shed": {"WHEAT": 10}, "seeds": {}}
         market = {"prices": {"WHEAT": 30}}  # well above the sell threshold
-        plan = empty_plan(occupied_by_animal={"COW": 2, "SHEEP": 0, "GOOSE": 0})
+        plan = empty_plan(occupied_by_animal={"GOOSE": 2})
 
         orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
 
         sell_orders = [o for o in orders if o[0] == "SELL" and o[1] == "WHEAT"]
-        # 2 animals * FEED_DAYS_BUFFER(3) = 6 reserved; only the surplus (4) sells.
-        self.assertEqual(sell_orders, [["SELL", "WHEAT", 4]])
+        # 2 geese * FEED_DAYS_BUFFER(4) = 8 reserved; only 2 sells.
+        self.assertEqual(sell_orders, [["SELL", "WHEAT", 2]])
 
     def test_animal_purchases_respect_the_cash_reserve(self) -> None:
         farm = make_farm()
-        farm["money"] = 1200.0  # exactly the reserve floor, no surplus
+        farm["money"] = float(ANIMAL_CASH_RESERVE)  # exactly reserve, no surplus
         private = {"shed": {}, "seeds": {}}
         market = {"prices": {"WHEAT": 25}}
         plan = empty_plan()
@@ -152,18 +208,29 @@ class MarketOrderTests(unittest.TestCase):
 
         self.assertFalse(any(o[0] == "BUY_ANIMAL" for o in orders))
 
+    def test_carried_goose_counts_toward_the_flock_cap(self) -> None:
+        farm = make_farm()
+        farm["money"] = 5000.0
+        private = {"shed": {}, "seeds": {}, "inventories": [{"GOOSE": 1}]}
+        market = {"prices": {"WHEAT": 25}}
+        plan = empty_plan(occupied_by_animal={"GOOSE": 1})
+
+        orders = _market_orders(farm, private, market, day=5, hour=1, plan=plan)
+
+        self.assertFalse(any(o[0] == "BUY_ANIMAL" for o in orders))
+
 
 class LogisticsTests(unittest.TestCase):
     def test_unit_carrying_an_animal_walks_to_and_places_on_its_structure(self) -> None:
-        plan = empty_plan(empty_structures={"PASTURE": [(4, 4)], "COOP": []})
-        private = {"inventories": [{"COW": 1}], "shed": {}}
+        plan = empty_plan(empty_structures={"COOP": [(4, 4)]})
+        private = {"inventories": [{"GOOSE": 1}], "shed": {}}
 
         actions = _logistics_actions(
             unit_positions=[(2, 2)],
             private=private,
             board_size=5,
             plan=plan,
-            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+            animal_fill_priority=["GOOSE"],
         )
         self.assertEqual(actions[0], _move_toward((2, 2), (4, 4)))
 
@@ -172,9 +239,9 @@ class LogisticsTests(unittest.TestCase):
             private=private,
             board_size=5,
             plan=plan,
-            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+            animal_fill_priority=["GOOSE"],
         )
-        self.assertEqual(actions_at_target[0], ["PLACE", "COW"])
+        self.assertEqual(actions_at_target[0], ["PLACE", "GOOSE"])
 
     def test_unit_carrying_wheat_feeds_nearest_unfed_animal(self) -> None:
         plan = empty_plan(unfed_animals=[(4, 4)])
@@ -185,14 +252,14 @@ class LogisticsTests(unittest.TestCase):
             private=private,
             board_size=5,
             plan=plan,
-            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+            animal_fill_priority=["GOOSE"],
         )
         self.assertEqual(actions[0], ["FEED"])
 
-    def test_only_one_unit_picks_up_wheat_for_a_shared_feeding_need(self) -> None:
-        # Regression test: previously every idle unit independently queued a
-        # PICKUP for the same unfed animals, since the shared "still needs
-        # feeding" list was never reduced after a pickup was issued.
+    def test_each_goose_gets_a_distinct_parallel_wheat_pickup(self) -> None:
+        # A single courier carrying both units delays the second feed by
+        # several turns. Claim one target per hand so both geese receive
+        # wheat on the same trip without duplicate pickups.
         plan = empty_plan(unfed_animals=[(4, 4), (4, 3)])
         private = {"inventories": [{}, {}], "shed": {"WHEAT": 10}}
         shed_adjacent = (2, 2)  # _shed_access_tiles(5) for a 5x5 board
@@ -202,12 +269,11 @@ class LogisticsTests(unittest.TestCase):
             private=private,
             board_size=5,
             plan=plan,
-            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+            animal_fill_priority=["GOOSE"],
         )
 
         pickups = [a for a in actions if a is not None and a[0] == "PICKUP"]
-        self.assertEqual(len(pickups), 1)
-        self.assertEqual(pickups[0], ["PICKUP", "WHEAT", 2])
+        self.assertEqual(pickups, [["PICKUP", "WHEAT", 1], ["PICKUP", "WHEAT", 1]])
 
     def test_no_feed_source_falls_through_to_normal_task_pool(self) -> None:
         plan = empty_plan(unfed_animals=[(4, 4)])
@@ -218,7 +284,7 @@ class LogisticsTests(unittest.TestCase):
             private=private,
             board_size=5,
             plan=plan,
-            animal_fill_priority=["COW", "SHEEP", "GOOSE"],
+            animal_fill_priority=["GOOSE"],
         )
         self.assertIsNone(actions[0])
 
